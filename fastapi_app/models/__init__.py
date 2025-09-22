@@ -1,10 +1,7 @@
 """
-SQLAlchemy ORM models used by the application.
+SQLAlchemy ORM models package.
 
-The models package exposes individual model modules under a
-convenient namespace.  Importing :mod:`fastapi_app.models` will
-register all models with SQLAlchemy's declarative base so that the
-table metadata becomes available when creating the schema.
+Importing this package will register the models and expose User/Message/Base.
 """
 
-from .db_models import Message, User  # noqa: F401
+from .db_models import Base, Message, User  # noqa: F401
