@@ -27,8 +27,8 @@ ENV PORT=8000
 EXPOSE 8000
 
 # Set the default command to start the FastAPI application.  Uvicorn
-# is used as the ASGI server.  The ``--proxy-headers`` flag tells
+# is used as the ASGI server.  The `--proxy-headers` flag tells
 # Uvicorn to respect X‑Forwarded‑* headers which is often important
-# when behind a reverse proxy.  ``--host`` and ``--port`` bind the
+# when behind a reverse proxy.  `--host` and `--port` bind the
 # server to all interfaces on the configured port.
 CMD ["uvicorn", "fastapi_app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
