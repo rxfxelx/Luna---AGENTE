@@ -2,10 +2,14 @@
 Database configuration and helper functions.
 
 This module sets up the asynchronous SQLAlchemy engine and session
-factory.  The database connection URL is read from the ``DATABASE_URL``
-environment variable.  A simple table creation helper is also provided
-to initialise the schema at application startup when using SQLite or
-when migrations have not yet been applied.
+factory. It also normalises the DATABASE_URL so common provider
+formats like 'postgres://...' or 'postgresql://...' are converted to
+the required 'postgresql+asyncpg://...' for SQLAlchemy asyncio.
+
+Env vars:
+- DATABASE_URL  -> connection string (any of postgres://, postgresql://,
+                   postgresql+psycopg2://, postgresql+asyncpg://)
+- DB_SSLMODE    -> optional, default 'require' (set to 'disable' for local)
 """
 
 from __future__ import annotations
@@ -13,62 +17,79 @@ from __future__ import annotations
 import os
 from typing import AsyncGenerator
 
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-
-# Read the database URL from environment.  It must be in a form
-# supported by SQLAlchemy async engines, for example:
-# ``postgresql+asyncpg://user:password@hostname:port/database``
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise RuntimeError(
-        "DATABASE_URL environment variable must be set. "
-        "See .env.example for an example configuration."
-    )
-
-# Create the asynchronous engine.  ``future=True`` enables SQLAlchemy
-# 2.0 style usage; ``echo=False`` disables verbose SQL logging by
-# default (can be set to True for debugging).
-engine = create_async_engine(DATABASE_URL, future=True, echo=False)
-
-# Session factory bound to the async engine.  ``expire_on_commit=False``
-# prevents objects from being expired after each commit, which makes
-# them usable without re-loading.
-AsyncSessionLocal = sessionmaker(
-    bind=engine,
-    expire_on_commit=False,
-    class_=AsyncSession,
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
 )
 
-# Declarative base class.  All models should inherit from this.
-Base = declarative_base()
+
+def _normalize_db_url(raw_url: str) -> str:
+    """
+    Convert common Postgres URLs to the asyncpg dialect required by SQLAlchemy asyncio,
+    and add sslmode if requested.
+
+    Accepted inputs:
+      - postgres://user:pass@host:5432/db
+      - postgresql://user:pass@host:5432/db
+      - postgresql+psycopg2://user:pass@host:5432/db
+      - postgresql+asyncpg://user:pass@host:5432/db
+
+    Will output:
+      - postgresql+asyncpg://user:pass@host:5432/db?sslmode=<value>
+    """
+    if not raw_url or not raw_url.strip():
+        raise RuntimeError(
+            "DATABASE_URL is empty or not set. "
+            "Provide a valid Postgres connection string."
+        )
+
+    url = raw_url.strip()
+
+    # Normaliza o esquema para o driver assíncrono
+    if url.startswith("postgres://"):
+        url = "postgresql+asyncpg://" + url[len("postgres://") :]
+    elif url.startswith("postgresql://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql://") :]
+    elif url.startswith("postgresql+psycopg2://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql+psycopg2://") :]
+    # se já for postgresql+asyncpg://, mantém como está
+
+    # sslmode (útil em Railway e afins). Para local, use DB_SSLMODE=disable
+    sslmode = os.getenv("DB_SSLMODE", "require").lower()
+    if "sslmode=" not in url and sslmode and sslmode != "disable":
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode={sslmode}"
+
+    return url
+
+
+# --- Engine & Session ---
+DATABASE_URL = _normalize_db_url(os.getenv("DATABASE_URL", ""))
+
+engine: AsyncEngine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=True,
+)
+
+SessionLocal = async_sessionmaker(
+    bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Provide a transactional scope around a series of operations.
-
-    This dependency creates a new :class:`AsyncSession`, yields it
-    (allowing the caller to use it for database operations), and
-    ensures the session is properly closed after the request finishes.
-    """
-    async with AsyncSessionLocal() as session:
+    """FastAPI dependency that yields an AsyncSession."""
+    async with SessionLocal() as session:
         yield session
 
 
 async def init_models() -> None:
-    """Create database tables if they do not already exist.
-
-    This helper imports the model module so that SQLAlchemy is aware of
-    the defined tables and then calls ``create_all`` on the metadata.
-    In a production environment you should instead apply migrations
-    using a tool such as Alembic, but this function allows the schema
-    to be generated in environments where migrations have not yet
-    been applied (for example, during initial local development).
-    """
-    # Import the model definitions.  This side‑effect registers the
-    # table metadata with SQLAlchemy's metadata object on Base.
-    from .models import db_models  # noqa: F401
+    """Create tables on startup (for simple setups without Alembic)."""
+    # Import aqui para registrar o metadata
+    from .models.db_models import Base  # noqa: WPS433,F401
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
