@@ -4,7 +4,7 @@ Database configuration and helper functions.
 This module sets up the asynchronous SQLAlchemy engine and session
 factory. It also normalises the DATABASE_URL so common provider
 formats like 'postgres://...' or 'postgresql://...' are converted to
-the required 'postgresql+asyncpg://...' for SQLAlchemy asyncio.
+the required 'postgresql+asyncpg://' for SQLAlchemy asyncio.
 
 Env vars:
 - DATABASE_URL  -> connection string (any of postgres://, postgresql://,
@@ -47,16 +47,16 @@ def _normalize_db_url(raw_url: str) -> str:
 
     url = raw_url.strip()
 
-    # Normaliza o esquema para o driver assíncrono
+    # Normalize scheme to async driver
     if url.startswith("postgres://"):
         url = "postgresql+asyncpg://" + url[len("postgres://") :]
     elif url.startswith("postgresql://"):
         url = "postgresql+asyncpg://" + url[len("postgresql://") :]
     elif url.startswith("postgresql+psycopg2://"):
         url = "postgresql+asyncpg://" + url[len("postgresql+psycopg2://") :]
-    # se já for postgresql+asyncpg://, mantém como está
+    # if already postgresql+asyncpg:// keep as is
 
-    # sslmode (útil em Railway e afins). Para local, use DB_SSLMODE=disable
+    # sslmode (Railway often requires SSL). For local, set DB_SSLMODE=disable
     sslmode = os.getenv("DB_SSLMODE", "require").lower()
     if "sslmode=" not in url and sslmode and sslmode != "disable":
         sep = "&" if "?" in url else "?"
@@ -88,7 +88,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_models() -> None:
     """Create tables on startup (for simple setups without Alembic)."""
-    # Import aqui para registrar o metadata
+    # Import here to register metadata
     from .models.db_models import Base  # noqa: WPS433,F401
 
     async with engine.begin() as conn:
