@@ -7,16 +7,16 @@ formats like 'postgres://...' or 'postgresql://...' are converted to
 the required 'postgresql+asyncpg://' for SQLAlchemy asyncio.
 
 Env vars:
-- DATABASE_URL  -> connection string (any of postgres://, postgresql://,
-                   postgresql+psycopg2://, postgresql+asyncpg://)
-- DB_SSLMODE    -> optional: 'require' (padrão) ou 'disable'
-                   (com asyncpg, SSL é configurado via connect_args['ssl'])
+- DATABASE_URL   -> connection string (postgres://, postgresql://, postgresql+psycopg2://, postgresql+asyncpg://)
+- DB_SSLMODE     -> 'require' (default), 'disable', 'require_noverify', 'verify-ca', 'verify-full'
+- DB_SSLROOTCERT -> path to CA file when using verify-ca/full (optional)
 """
 
 from __future__ import annotations
 
 import os
-from typing import AsyncGenerator, Dict, Any
+import ssl
+from typing import Any, AsyncGenerator, Dict
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -29,25 +29,14 @@ from sqlalchemy.ext.asyncio import (
 def _normalize_db_url(raw_url: str) -> str:
     """
     Convert common Postgres URLs to the asyncpg dialect required by SQLAlchemy asyncio.
-
-    Accepted inputs:
-      - postgres://user:pass@host:5432/db
-      - postgresql://user:pass@host:5432/db
-      - postgresql+psycopg2://user:pass@host:5432/db
-      - postgresql+asyncpg://user:pass@host:5432/db
-
-    Will output:
-      - postgresql+asyncpg://user:pass@host:5432/db
+    Output is always 'postgresql+asyncpg://...'
     """
     if not raw_url or not raw_url.strip():
         raise RuntimeError(
             "DATABASE_URL is empty or not set. "
             "Provide a valid Postgres connection string."
         )
-
     url = raw_url.strip()
-
-    # Normalize scheme to async driver
     if url.startswith("postgres://"):
         url = "postgresql+asyncpg://" + url[len("postgres://") :]
     elif url.startswith("postgresql://"):
@@ -55,22 +44,39 @@ def _normalize_db_url(raw_url: str) -> str:
     elif url.startswith("postgresql+psycopg2://"):
         url = "postgresql+asyncpg://" + url[len("postgresql+psycopg2://") :]
     # if already postgresql+asyncpg:// keep as is
-
-    # IMPORTANT: do NOT append 'sslmode' – asyncpg doesn't support it.
     return url
 
 
 def _build_connect_args() -> Dict[str, Any]:
     """
     Map DB_SSLMODE to asyncpg's 'ssl' connect arg.
-
-    - 'disable' -> {}
-    - anything else (require/verify-*) -> {'ssl': True}
+    - 'disable'           -> {}
+    - 'require' (default) -> {'ssl': True}  (usa CA do sistema - requer ca-certificates)
+    - 'require_noverify'  -> {'ssl': <SSLContext sem verificação>}
+    - 'verify-ca'/'verify-full' -> carrega CA de DB_SSLROOTCERT; em 'verify-full' mantém check_hostname=True
     """
     mode = os.getenv("DB_SSLMODE", "require").lower()
+    ca_path = os.getenv("DB_SSLROOTCERT")
+
     if mode in {"disable", "off", "false", "no"}:
         return {}
-    # Railway/Cloud: require SSL
+
+    if mode in {"require_noverify", "noverify", "insecure"}:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return {"ssl": ctx}
+
+    if mode in {"verify-ca", "verify_full", "verify-full"}:
+        if not ca_path or not os.path.exists(ca_path):
+            raise RuntimeError(
+                "DB_SSLMODE set to verify-ca/verify-full but DB_SSLROOTCERT was not provided or not found."
+            )
+        ctx = ssl.create_default_context(cafile=ca_path)
+        # verify-full também valida hostname (padrão do context)
+        return {"ssl": ctx}
+
+    # default: require (usa bundle do sistema)
     return {"ssl": True}
 
 
@@ -98,7 +104,6 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_models() -> None:
     """Create tables on startup (for simple setups without Alembic)."""
-    # Import here to register metadata
     from .models.db_models import Base  # noqa: WPS433,F401
 
     async with engine.begin() as conn:
