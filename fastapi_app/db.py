@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import ssl
 from typing import Any, AsyncGenerator, Dict
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -50,10 +51,12 @@ def _normalize_db_url(raw_url: str) -> str:
 def _build_connect_args() -> Dict[str, Any]:
     """
     Map DB_SSLMODE to asyncpg's 'ssl' connect arg.
-    - 'disable'           -> {}
-    - 'require' (default) -> {'ssl': True}  (usa CA do sistema - requer ca-certificates)
-    - 'require_noverify'  -> {'ssl': <SSLContext sem verificação>}
-    - 'verify-ca'/'verify-full' -> carrega CA de DB_SSLROOTCERT; em 'verify-full' mantém check_hostname=True
+
+    - 'disable'              -> {}
+    - 'require' (default)    -> {'ssl': True}  (usa CA do sistema - precisa do pacote ca-certificates)
+    - 'require_noverify'     -> {'ssl': <SSLContext sem verificação>}
+    - 'verify-ca'/'verify-full'
+        -> carrega CA de DB_SSLROOTCERT; em 'verify-full' mantém check_hostname=True
     """
     mode = os.getenv("DB_SSLMODE", "require").lower()
     ca_path = os.getenv("DB_SSLROOTCERT")
@@ -73,7 +76,7 @@ def _build_connect_args() -> Dict[str, Any]:
                 "DB_SSLMODE set to verify-ca/verify-full but DB_SSLROOTCERT was not provided or not found."
             )
         ctx = ssl.create_default_context(cafile=ca_path)
-        # verify-full também valida hostname (padrão do context)
+        # verify-full já valida hostname por padrão
         return {"ssl": ctx}
 
     # default: require (usa bundle do sistema)
