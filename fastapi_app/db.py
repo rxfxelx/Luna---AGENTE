@@ -9,13 +9,14 @@ the required 'postgresql+asyncpg://' for SQLAlchemy asyncio.
 Env vars:
 - DATABASE_URL  -> connection string (any of postgres://, postgresql://,
                    postgresql+psycopg2://, postgresql+asyncpg://)
-- DB_SSLMODE    -> optional, default 'require' (set to 'disable' for local)
+- DB_SSLMODE    -> optional: 'require' (padrão) ou 'disable'
+                   (com asyncpg, SSL é configurado via connect_args['ssl'])
 """
 
 from __future__ import annotations
 
 import os
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Dict, Any
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -27,8 +28,7 @@ from sqlalchemy.ext.asyncio import (
 
 def _normalize_db_url(raw_url: str) -> str:
     """
-    Convert common Postgres URLs to the asyncpg dialect required by SQLAlchemy asyncio,
-    and add sslmode if requested.
+    Convert common Postgres URLs to the asyncpg dialect required by SQLAlchemy asyncio.
 
     Accepted inputs:
       - postgres://user:pass@host:5432/db
@@ -37,7 +37,7 @@ def _normalize_db_url(raw_url: str) -> str:
       - postgresql+asyncpg://user:pass@host:5432/db
 
     Will output:
-      - postgresql+asyncpg://user:pass@host:5432/db?sslmode=<value>
+      - postgresql+asyncpg://user:pass@host:5432/db
     """
     if not raw_url or not raw_url.strip():
         raise RuntimeError(
@@ -56,13 +56,22 @@ def _normalize_db_url(raw_url: str) -> str:
         url = "postgresql+asyncpg://" + url[len("postgresql+psycopg2://") :]
     # if already postgresql+asyncpg:// keep as is
 
-    # sslmode (Railway often requires SSL). For local, set DB_SSLMODE=disable
-    sslmode = os.getenv("DB_SSLMODE", "require").lower()
-    if "sslmode=" not in url and sslmode and sslmode != "disable":
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}sslmode={sslmode}"
-
+    # IMPORTANT: do NOT append 'sslmode' – asyncpg doesn't support it.
     return url
+
+
+def _build_connect_args() -> Dict[str, Any]:
+    """
+    Map DB_SSLMODE to asyncpg's 'ssl' connect arg.
+
+    - 'disable' -> {}
+    - anything else (require/verify-*) -> {'ssl': True}
+    """
+    mode = os.getenv("DB_SSLMODE", "require").lower()
+    if mode in {"disable", "off", "false", "no"}:
+        return {}
+    # Railway/Cloud: require SSL
+    return {"ssl": True}
 
 
 # --- Engine & Session ---
@@ -73,6 +82,7 @@ engine: AsyncEngine = create_async_engine(
     echo=False,
     future=True,
     pool_pre_ping=True,
+    connect_args=_build_connect_args(),
 )
 
 SessionLocal = async_sessionmaker(
