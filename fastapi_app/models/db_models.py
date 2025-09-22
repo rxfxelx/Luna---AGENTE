@@ -1,71 +1,95 @@
 """
-ORM model definitions for the Luna backend.
+Database configuration and helper functions.
 
-This module defines the ``User`` and ``Message`` models used to
-persist chat history and user data in a relational database.  The
-models use SQLAlchemy's declarative syntax and are designed to be
-loaded asynchronously via the engine configured in
-``fastapi_app.db``.
+This module sets up the asynchronous SQLAlchemy engine and session
+factory. It also normalises the DATABASE_URL so common provider
+formats like 'postgres://...' or 'postgresql://...' are converted to
+the required 'postgresql+asyncpg://' for SQLAlchemy asyncio.
+
+Env vars:
+- DATABASE_URL  -> connection string (any of postgres://, postgresql://,
+                   postgresql+psycopg2://, postgresql+asyncpg://)
+- DB_SSLMODE    -> optional, default 'require' (set to 'disable' for local)
 """
 
 from __future__ import annotations
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, func
-from sqlalchemy.orm import relationship
+import os
+from typing import AsyncGenerator
 
-from ..db import Base
-
-
-class User(Base):
-    """Represents a WhatsApp user interacting with the Luna assistant."""
-
-    __tablename__ = "users"
-
-    id: int = Column(Integer, primary_key=True, index=True)
-    # The WhatsApp phone number (or jid without the domain) is stored
-    # here.  It must be unique so that each user corresponds to a
-    # single conversation thread.
-    phone: str = Column(String(30), unique=True, nullable=False)
-    # Optional display name extracted from incoming messages.  This
-    # value can change over time as contacts update their names.
-    name: str | None = Column(String(255))
-    # ID of the OpenAI Assistant thread associated with this user.
-    thread_id: str | None = Column(String(255))
-    # Timestamp when the user record was created.
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    # Relationship back to messages sent by or to this user.
-    messages = relationship("Message", back_populates="user", cascade="all, delete-orphan")
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 
-class Message(Base):
-    """Represents a single message exchanged between the user and assistant."""
+def _normalize_db_url(raw_url: str) -> str:
+    """
+    Convert common Postgres URLs to the asyncpg dialect required by SQLAlchemy asyncio,
+    and add sslmode if requested.
 
-    __tablename__ = "messages"
+    Accepted inputs:
+      - postgres://user:pass@host:5432/db
+      - postgresql://user:pass@host:5432/db
+      - postgresql+psycopg2://user:pass@host:5432/db
+      - postgresql+asyncpg://user:pass@host:5432/db
 
-    id: int = Column(Integer, primary_key=True, index=True)
-    # Foreign key linking to the owning user.  The ``ondelete="CASCADE"``
-    # ensures that when a user is removed all of their messages are
-    # automatically deleted as well.
-    user_id: int = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    # Indicates whether the message was sent by the user or the assistant.
-    sender: str = Column(String(10), nullable=False)
-    # Plain‑text content of the message, if applicable.  For media
-    # messages this may contain a placeholder description such as
-    # "[image]" or a transcription of an audio file.
-    content: str | None = Column(Text)
-    # Type of the media attached to the message: ``text``, ``image``,
-    # ``audio``, ``video``, ``document`` or ``vcard``.  Unknown types
-    # are stored as ``unknown``.
-    media_type: str | None = Column(String(20))
-    # For media messages this field stores a URL or identifier that
-    # references where the file can be retrieved.  It could point
-    # directly to the Uazapi file URL or a record in Baserow after
-    # uploading.
-    media_url: str | None = Column(Text)
-    # Timestamp of when the message was created.  The server's current
-    # time is used as the default value.
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    Will output:
+      - postgresql+asyncpg://user:pass@host:5432/db?sslmode=<value>
+    """
+    if not raw_url or not raw_url.strip():
+        raise RuntimeError(
+            "DATABASE_URL is empty or not set. "
+            "Provide a valid Postgres connection string."
+        )
 
-    # Relationship back to the owning user record.
-    user = relationship("User", back_populates="messages")
+    url = raw_url.strip()
+
+    # Normalize scheme to async driver
+    if url.startswith("postgres://"):
+        url = "postgresql+asyncpg://" + url[len("postgres://") :]
+    elif url.startswith("postgresql://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql://") :]
+    elif url.startswith("postgresql+psycopg2://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql+psycopg2://") :]
+    # if already postgresql+asyncpg:// keep as is
+
+    # sslmode (Railway often requires SSL). For local, set DB_SSLMODE=disable
+    sslmode = os.getenv("DB_SSLMODE", "require").lower()
+    if "sslmode=" not in url and sslmode and sslmode != "disable":
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode={sslmode}"
+
+    return url
+
+
+# --- Engine & Session ---
+DATABASE_URL = _normalize_db_url(os.getenv("DATABASE_URL", ""))
+
+engine: AsyncEngine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=True,
+)
+
+SessionLocal = async_sessionmaker(
+    bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+)
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency that yields an AsyncSession."""
+    async with SessionLocal() as session:
+        yield session
+
+
+async def init_models() -> None:
+    """Create tables on startup (for simple setups without Alembic)."""
+    # Import here to register metadata
+    from .models.db_models import Base  # noqa: WPS433,F401
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
