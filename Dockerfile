@@ -4,7 +4,7 @@ FROM python:3.11-slim
 
 LABEL maintainer="Luna Backend Team <noreply@example.com>"
 
-# 1) CA bundle para TLS (Postgres/HTTPs)
+# Instala pacote de certificados (necessário para conexões SSL)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && update-ca-certificates \
@@ -12,11 +12,11 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# 2) Dependências Python
+# Copia e instala dependências
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 3) Código
+# Copia código e env de exemplo
 COPY fastapi_app ./fastapi_app
 COPY .env.example ./
 
