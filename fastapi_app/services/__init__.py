@@ -1,12 +1,21 @@
 """
-Utility functions and classes for integrating with external services.
+Service layer exports.
 
-This package houses reusable helpers for talking to the Uazapi
-(WhatsApp) API, the OpenAI Assistants API, and optionally for
-uploading files to Baserow.  Keeping these concerns separated from
-request handling makes the route definitions cleaner and easier to
-understand.
+This module re-exports helper functions so that other modules can import
+from fastapi_app.services without referencing individual submodules.
 """
 
-from .uazapi_service import send_message, upload_file_to_baserow  # noqa: F401
+from .uazapi_service import (
+    send_whatsapp_message,
+    send_message,
+    upload_file_to_baserow,
+)  # noqa: F401
 from .openai_service import get_or_create_thread, ask_assistant  # noqa: F401
+
+__all__ = [
+    "send_whatsapp_message",
+    "send_message",
+    "upload_file_to_baserow",
+    "get_or_create_thread",
+    "ask_assistant",
+]
