@@ -63,12 +63,13 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
 TEXT_KEYS_PRIORITY = (
-    # caminhos mais comuns
+    # caminhos mais comuns (Baileys-like)
     "data.data.messages.0.message.conversation",
     "data.data.messages.0.message.extendedTextMessage.text",
     "messages.0.message.conversation",
     "messages.0.message.extendedTextMessage.text",
-    # formatos simples do Uazapi
+    # variações simples do Uazapi
+    "messages.0.text",
     "data.text",
     "data.message",
     "data.body",
@@ -103,10 +104,10 @@ def _deep_get(dct: Dict[str, Any], path: str, default=None):
 
 def _norm_phone_from_jid(value: Any) -> Optional[str]:
     """
-    Extrai telefone de um JID. Aceitamos:
+    Aceita:
       - '<digits>@s.whatsapp.net'
       - '<digits>@c.us'
-      - '<digits>' (apenas se tiver >= 10 dígitos)
+      - '<digits>' (>=10 dígitos)
     Ignora grupos ('@g.us').
     """
     if not isinstance(value, str):
@@ -121,9 +122,7 @@ def _norm_phone_from_jid(value: Any) -> Optional[str]:
 
 def _scan_for_phone(obj: Any) -> Optional[str]:
     """
-    Fallback final: varre o JSON procurando padrões de telefone.
-    Preferência por strings com '@s.whatsapp.net' ou '@c.us'.
-    Depois tenta a 1ª sequência de 10-15 dígitos.
+    Varredura final por número (prefere JID, depois regex 10-15 dígitos).
     """
     found_plain: Optional[str] = None
 
@@ -151,15 +150,13 @@ def _scan_for_phone(obj: Any) -> Optional[str]:
 
 def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
     """
-    Procura texto em múltiplos caminhos conhecidos e, por fim,
-    varre o JSON por chaves relevantes.
+    Procura texto em caminhos conhecidos e, se não achar, varre por chaves típicas.
     """
     for path in TEXT_KEYS_PRIORITY:
         val = _deep_get(event, path)
         if isinstance(val, str) and val.strip():
             return val.strip()
 
-    # varredura ampla por chaves típicas
     keys = {"text", "message", "body", "content", "caption", "conversation"}
     found: Optional[str] = None
 
@@ -180,14 +177,26 @@ def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
     walk(event)
     return found
 
+def _is_from_me(event: Dict[str, Any]) -> bool:
+    """
+    Detecta mensagens enviadas pelo próprio número/bot para evitar loop.
+    Checa várias formas: key.fromMe, fromMe, message?.fromMe, etc.
+    """
+    for path in (
+        "data.data.messages.0.key.fromMe",
+        "messages.0.key.fromMe",
+        "fromMe",
+        "data.fromMe",
+        "message.fromMe",
+    ):
+        v = _deep_get(event, path)
+        if isinstance(v, bool) and v:
+            return True
+    return False
 
 def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     """
     Retorna: {"phone": str|None, "msg_type": str, "text": str|None}
-    - Prioriza JIDs corretos (key.remoteJid, chat.chatId, chat.remoteJid).
-    - NÃO usa chat.id se não tiver sufixo '@...' (evita IDs alfanuméricos).
-    - Se JID for de grupo (@g.us), tenta participant/author.
-    - Valida tamanho mínimo (>= 10 dígitos).
     """
     # Mensagem "Baileys-like"
     msg = _deep_get(event, "data.data.messages.0") or _deep_get(event, "messages.0") or {}
@@ -208,18 +217,14 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
         if phone:
             break
 
-    # 2) Grupos: usar participant/author se remoteJid indicar grupo
+    # 2) Grupos: usar participant/author se for @g.us
     is_group = False
     for maybe in (_deep_get(msg, "key.remoteJid"), msg.get("remoteJid") if isinstance(msg, dict) else None):
         if isinstance(maybe, str) and "@g.us" in maybe:
             is_group = True
             break
     if not phone and is_group:
-        for p in (
-            _deep_get(msg, "key.participant"),
-            _deep_get(event, "participant"),
-            _deep_get(event, "author"),
-        ):
+        for p in (_deep_get(msg, "key.participant"), _deep_get(event, "participant"), _deep_get(event, "author")):
             phone = _norm_phone_from_jid(p)
             if phone:
                 break
@@ -236,14 +241,14 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
                 phone = cand
                 break
 
-    # 4) NÃO usar chat.id a menos que tenha sufixo
+    # 4) NÃO usar chat.id sem sufixo
     if not phone:
         p = _deep_get(event, "chat.id")
         norm = _norm_phone_from_jid(p)
         if norm:
             phone = norm
 
-    # 5) Varredura completa (preferência @..., fallback regex 10-15 dígitos)
+    # 5) Varredura completa
     if not phone:
         phone = _scan_for_phone(event)
 
@@ -269,8 +274,7 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     if phone:
         digits = _only_digits(phone)
         if len(digits) < 10:
-            sample = str(event)[:200]
-            print(f"[webhook] phone_too_short extracted={phone} sample={sample}")
+            print(f"[webhook] phone_too_short extracted={phone} sample={str(event)[:200]}")
             phone = None
 
     return {"phone": phone, "msg_type": msg_type, "text": text}
@@ -326,14 +330,20 @@ async def webhook_post(
     except Exception:
         return JSONResponse({"received": False, "reason": "invalid JSON"}, status_code=200)
 
+    # Ignora mensagens do próprio bot para evitar loop
+    if _is_from_me(payload):
+        return JSONResponse({"received": True, "note": "from_me"}, status_code=200)
+
     info = _extract_sender_and_type(payload)
     phone = info.get("phone")
     msg_type = info.get("msg_type")
     text = info.get("text")
 
+    # Log leve para diagnóstico (sem dados sensíveis)
+    print(f"[webhook] extracted phone={phone} type={msg_type} text_len={(len(text) if text else 0)}")
+
     if not phone:
-        sample = str(payload)[:400]
-        print(f"[webhook] no phone extracted; sample={sample}")
+        print(f"[webhook] no phone extracted; sample={str(payload)[:400]}")
         return JSONResponse({"received": True, "note": "no phone"}, status_code=200)
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
