@@ -70,14 +70,13 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
     async with httpx.AsyncClient(timeout=60.0) as client:
         # 1) Adiciona a mensagem do usuário
         try:
-            # v2 aceita blocks; algumas contas ainda aceitam string simples.
-            # Tentamos blocks primeiro; se falhar, caímos para string.
             r = await client.post(
                 f"{_BASE_URL}/threads/{thread_id}/messages",
                 headers=_headers(),
                 json={"role": "user", "content": [{"type": "text", "text": user_message}]},
             )
             if r.status_code >= 400:
+                # fallback para conteúdo simples
                 await client.post(
                     f"{_BASE_URL}/threads/{thread_id}/messages",
                     headers=_headers(),
