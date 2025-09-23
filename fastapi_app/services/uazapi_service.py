@@ -7,9 +7,9 @@ Expõe:
 - upload_file_to_baserow(media_url) -> Optional[dict]
 
 Ajustes:
-- Default do endpoint de texto agora é **/send/text** (pois é o que sua instância expõe).
-- Mantidos fallbacks (inclui /send/message e outras variantes).
-- Header de autenticação padrão: 'token' (com compat para 'apikey' e 'Authorization: Bearer').
+- Garante que o primeiro endpoint tentado para texto seja SEMPRE '/send/text' (POST),
+  como prescrito no uazapiGO v2. Mantém fallbacks para outras rotas.
+- Header de autenticação padrão: 'token' (configurável por env).
 """
 
 from __future__ import annotations
@@ -22,14 +22,15 @@ import httpx
 # -------------------- Config --------------------
 UAZAPI_BASE_URL = os.getenv("UAZAPI_BASE_URL", "").rstrip("/")
 UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN", "")
+
 # 'token' | 'apikey' | 'authorization_bearer'
 UAZAPI_AUTH_HEADER_NAME = os.getenv("UAZAPI_AUTH_HEADER_NAME", "token").lower()
 
-# Rotas (alterado: default texto = /send/text)
+# Rotas vindas do ambiente (usadas, mas SEMPRE tentamos '/send/text' primeiro)
 UAZAPI_SEND_TEXT_PATH = os.getenv("UAZAPI_SEND_TEXT_PATH", "/send/text")
 UAZAPI_SEND_MEDIA_PATH = os.getenv("UAZAPI_SEND_MEDIA_PATH", "/send/media")
 
-# Fallbacks comuns (sua instância usa /send/text; deixamos outras como backup)
+# Fallbacks comuns observados em instalações diferentes
 _TEXT_FALLBACKS = ["/send/message", "/api/sendText", "/sendText", "/messages/send", "/message/send"]
 _MEDIA_FALLBACKS = ["/send/file", "/api/sendFile", "/api/sendMedia"]
 
@@ -40,14 +41,26 @@ def _ensure_leading_slash(path: str) -> str:
 def _only_digits(s: str) -> str:
     return "".join(ch for ch in s if ch.isdigit())
 
+def _dedup(seq: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in seq:
+        if not x:
+            continue
+        x = _ensure_leading_slash(x)
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
 def _headers() -> Dict[str, str]:
     """
     Constrói headers aceitando variações de autenticação.
-    Padrão: header 'token'. Mantemos 'apikey' e 'Authorization: Bearer' por tolerância.
+    Padrão: header 'token'.
     """
-    base = {"Accept": "application/json", "Content-Type": "application/json"}
     if not UAZAPI_TOKEN:
         raise RuntimeError("UAZAPI_TOKEN não configurado.")
+    base = {"Accept": "application/json", "Content-Type": "application/json"}
     if UAZAPI_AUTH_HEADER_NAME in {"token", "x-token"}:
         base["token"] = UAZAPI_TOKEN
     elif UAZAPI_AUTH_HEADER_NAME in {"apikey", "api-key", "api_key"}:
@@ -55,10 +68,7 @@ def _headers() -> Dict[str, str]:
     elif UAZAPI_AUTH_HEADER_NAME in {"authorization_bearer", "authorization", "bearer"}:
         base["Authorization"] = f"Bearer {UAZAPI_TOKEN}"
     else:
-        base["token"] = UAZAPI_TOKEN
-    # compat extra (não atrapalha se ignorado pelo servidor):
-    base.setdefault("apikey", UAZAPI_TOKEN)
-    base.setdefault("Authorization", f"Bearer {UAZAPI_TOKEN}")
+        base["token"] = UAZAPI_TOKEN  # fallback seguro
     return base
 
 def _chatid_variants(phone: str) -> Iterable[str]:
@@ -93,14 +103,16 @@ def _infer_mime_from_url(url: str) -> str:
         return "audio/ogg"
     return "application/octet-stream"
 
-def _endpoint_list(primary: str, fallbacks: list[str]) -> list[str]:
-    primary = _ensure_leading_slash(primary or "/")
-    items = [primary]
-    for f in fallbacks:
-        p = _ensure_leading_slash(f)
-        if p not in items:
-            items.append(p)
-    return items
+def _text_endpoints() -> list[str]:
+    """
+    Ordem garantida: '/send/text' SEMPRE primeiro, depois env e fallbacks.
+    """
+    candidates = ["/send/text", UAZAPI_SEND_TEXT_PATH] + _TEXT_FALLBACKS
+    return _dedup(candidates)
+
+def _media_endpoints() -> list[str]:
+    candidates = [UAZAPI_SEND_MEDIA_PATH, "/send/media"] + _MEDIA_FALLBACKS
+    return _dedup(candidates)
 
 # -------------------- Senders --------------------
 async def send_whatsapp_message(
@@ -115,25 +127,22 @@ async def send_whatsapp_message(
     """
     Envia mensagem via Uazapi com múltiplas tentativas (endpoints/payloads).
     Prioriza:
-      - endpoint de texto: /send/text  (compatível com sua instância)
-      - header: token
+      - endpoint de texto: /send/text  (POST)
+      - header: token (ou conforme env)
       - payload: {"chatId": "<digits>@c.us", "text": "..."}
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
 
-    text_endpoints = _endpoint_list(UAZAPI_SEND_TEXT_PATH or "/send/text", _TEXT_FALLBACKS)
-    media_endpoints = _endpoint_list(UAZAPI_SEND_MEDIA_PATH or "/send/media", _MEDIA_FALLBACKS)
-
     headers = _headers()
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
         if type_ == "text" or not media_url:
-            for endpoint in text_endpoints:
+            for endpoint in _text_endpoints():
                 for cid in _chatid_variants(phone):
                     candidates = [
-                        {"chatId": cid, "text": content},                    # padrão UazapiGo
-                        {"phone": _only_digits(cid), "text": content},        # variação aceita por alguns
-                        {"number": _only_digits(cid), "message": content},    # variação estilo WPPConnect-like
+                        {"chatId": cid, "text": content},                    # padrão uazapiGO v2
+                        {"phone": _only_digits(cid), "text": content},        # algumas variações aceitam
+                        {"number": _only_digits(cid), "message": content},    # WPPConnect-like
                     ]
                     for payload in candidates:
                         try:
@@ -151,7 +160,7 @@ async def send_whatsapp_message(
             raise RuntimeError(f"Uazapi text send failed for phone={phone}")
         else:
             mime = mime_type or _infer_mime_from_url(media_url)
-            for endpoint in media_endpoints:
+            for endpoint in _media_endpoints():
                 for cid in _chatid_variants(phone):
                     candidates = [
                         {"chatId": cid, "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
