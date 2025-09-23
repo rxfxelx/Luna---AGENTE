@@ -2,17 +2,17 @@
 Integração com Uazapi (WhatsApp) e upload opcional para Baserow.
 
 Expõe:
-- send_whatsapp_message(phone, content, type_="text", media_url=None, mime_type=None, caption=None) -> dict
-- send_message(...) -> alias compatível (chama send_whatsapp_message)
+- send_whatsapp_message(phone, content, type_="text", media_url=None, mime_type=None, caption=None)
+- send_message(...) -> alias compatível (usa send_whatsapp_message)
 - upload_file_to_baserow(media_url) -> Optional[dict]
 
-ENVs esperadas:
+Requisitos de ENV:
 - UAZAPI_BASE_URL        (ex.: https://sua-instancia.uazapi.com)
 - UAZAPI_TOKEN           (token da INSTÂNCIA — não o admin)
 - UAZAPI_SEND_TEXT_PATH  (default: /send/text)
 - UAZAPI_SEND_MEDIA_PATH (default: /send/media)
-- BASEROW_BASE_URL       (opcional, p/ upload de mídia)
-- BASEROW_API_TOKEN      (opcional, p/ upload de mídia)
+- BASEROW_BASE_URL       (opcional, para upload de mídia)
+- BASEROW_API_TOKEN      (opcional, para upload de mídia)
 """
 
 from __future__ import annotations
@@ -22,19 +22,19 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-# ---- Uazapi config ----
+# Uazapi config
 UAZAPI_BASE_URL = os.getenv("UAZAPI_BASE_URL", "").rstrip("/")
 UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN", "")
 UAZAPI_SEND_TEXT_PATH = os.getenv("UAZAPI_SEND_TEXT_PATH", "/send/text")
 UAZAPI_SEND_MEDIA_PATH = os.getenv("UAZAPI_SEND_MEDIA_PATH", "/send/media")
 
-# ---- Baserow config (opcional) ----
+# Baserow config (optional)
 BASEROW_BASE_URL = os.getenv("BASEROW_BASE_URL", "").rstrip("/")
 BASEROW_API_TOKEN = os.getenv("BASEROW_API_TOKEN", "")
 
 
 def _headers() -> Dict[str, str]:
-    # Alguns setups aceitam 'apikey', outros 'Bearer'. Enviamos ambos.
+    """Build request headers for Uazapi."""
     return {
         "apikey": UAZAPI_TOKEN,
         "Authorization": f"Bearer {UAZAPI_TOKEN}",
@@ -78,8 +78,8 @@ async def send_whatsapp_message(
     """
     Envia mensagem via Uazapi.
 
-    - Texto: payload = {"chatId": phone, "text": content}
-    - Mídia: payload = {"chatId": phone, "fileUrl": media_url, "mimeType": mime, "caption": caption|content}
+    - Para texto: payload -> {"chatId": phone, "text": content}
+    - Para mídia: payload -> {"chatId": phone, "fileUrl": media_url, "mimeType": mime, "caption": caption|content}
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
@@ -102,7 +102,6 @@ async def send_whatsapp_message(
                 "mimeType": mime,
                 "caption": caption if caption is not None else content,
             }
-
         resp = await client.post(endpoint, json=payload, headers=_headers())
         resp.raise_for_status()
         try:
@@ -111,7 +110,6 @@ async def send_whatsapp_message(
             return {"status": "ok", "http_status": resp.status_code}
 
 
-# Back-compat: sua versão anterior chamava 'send_message'.
 async def send_message(
     *,
     phone: str,
@@ -119,22 +117,31 @@ async def send_message(
     media_url: Optional[str] = None,
     mime_type: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Wrapper compatível que delega a send_whatsapp_message."""
+    """
+    Alias para retrocompatibilidade. Encaminha para send_whatsapp_message.
+
+    Se media_url for fornecida, envia como mídia; caso contrário, texto.
+    """
     if media_url:
         mime = mime_type or _infer_mime_from_url(media_url)
         return await send_whatsapp_message(
-            phone=phone, content=text, type_="media", media_url=media_url, mime_type=mime, caption=text
+            phone=phone,
+            content=text,
+            type_="media",
+            media_url=media_url,
+            mime_type=mime,
+            caption=text,
         )
     return await send_whatsapp_message(phone=phone, content=text, type_="text")
 
 
 async def upload_file_to_baserow(media_url: str) -> Optional[dict]:
     """
-    Faz download do arquivo em media_url e tenta subir como "user file" no Baserow.
+    Faz download do arquivo em media_url e tenta subir como 'user file' no Baserow.
 
-    Endpoints tentados (nessa ordem):
-      1) /api/user-files/upload-file/  (padrão atual)
-      2) /api/userfiles/upload_file/   (fallback legado)
+    Endpoints tentados (nesta ordem):
+      1) /api/user-files/upload-file/
+      2) /api/userfiles/upload_file/
     """
     if not BASEROW_BASE_URL or not BASEROW_API_TOKEN:
         print("Baserow não configurado – pulando upload de arquivo.")
@@ -160,7 +167,7 @@ async def upload_file_to_baserow(media_url: str) -> Optional[dict]:
                     upload_resp = await client.post(upload_url, headers=headers, files=files)
                     if upload_resp.status_code < 400:
                         return upload_resp.json()
-                except Exception as exc:  # tente próximo endpoint
+                except Exception as exc:
                     last_exc = exc
 
             if last_exc:
