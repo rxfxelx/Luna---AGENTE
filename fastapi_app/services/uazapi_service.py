@@ -7,10 +7,9 @@ Expõe:
 - upload_file_to_baserow(media_url) -> Optional[dict]
 
 Ajustes:
-- Rota padrão de texto agora é /send/message (doc Uazapi).
-- Header de autenticação padrão agora é 'token'.
-- Uso prioritário de 'chatId' com sufixo '@c.us' (fallback '@s.whatsapp.net').
-- Tentativas múltiplas de endpoint e payload permanecem (tolerância a variações).
+- Default do endpoint de texto agora é **/send/text** (pois é o que sua instância expõe).
+- Mantidos fallbacks (inclui /send/message e outras variantes).
+- Header de autenticação padrão: 'token' (com compat para 'apikey' e 'Authorization: Bearer').
 """
 
 from __future__ import annotations
@@ -26,12 +25,12 @@ UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN", "")
 # 'token' | 'apikey' | 'authorization_bearer'
 UAZAPI_AUTH_HEADER_NAME = os.getenv("UAZAPI_AUTH_HEADER_NAME", "token").lower()
 
-# Rotas (alterado: default texto = /send/message)
-UAZAPI_SEND_TEXT_PATH = os.getenv("UAZAPI_SEND_TEXT_PATH", "/send/message")
+# Rotas (alterado: default texto = /send/text)
+UAZAPI_SEND_TEXT_PATH = os.getenv("UAZAPI_SEND_TEXT_PATH", "/send/text")
 UAZAPI_SEND_MEDIA_PATH = os.getenv("UAZAPI_SEND_MEDIA_PATH", "/send/media")
 
-# Fallbacks comuns observados em instalações diferentes
-_TEXT_FALLBACKS = ["/api/sendText", "/sendText", "/messages/send", "/message/send", "/send/text"]
+# Fallbacks comuns (sua instância usa /send/text; deixamos outras como backup)
+_TEXT_FALLBACKS = ["/send/message", "/api/sendText", "/sendText", "/messages/send", "/message/send"]
 _MEDIA_FALLBACKS = ["/send/file", "/api/sendFile", "/api/sendMedia"]
 
 # -------------------- Helpers --------------------
@@ -56,9 +55,8 @@ def _headers() -> Dict[str, str]:
     elif UAZAPI_AUTH_HEADER_NAME in {"authorization_bearer", "authorization", "bearer"}:
         base["Authorization"] = f"Bearer {UAZAPI_TOKEN}"
     else:
-        # fallback seguro
         base["token"] = UAZAPI_TOKEN
-    # headers extras para compatibilidade (não atrapalham se ignorados)
+    # compat extra (não atrapalha se ignorado pelo servidor):
     base.setdefault("apikey", UAZAPI_TOKEN)
     base.setdefault("Authorization", f"Bearer {UAZAPI_TOKEN}")
     return base
@@ -117,25 +115,24 @@ async def send_whatsapp_message(
     """
     Envia mensagem via Uazapi com múltiplas tentativas (endpoints/payloads).
     Prioriza:
-      - endpoint de texto: /send/message
+      - endpoint de texto: /send/text  (compatível com sua instância)
       - header: token
       - payload: {"chatId": "<digits>@c.us", "text": "..."}
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
 
-    text_endpoints = _endpoint_list(UAZAPI_SEND_TEXT_PATH or "/send/message", _TEXT_FALLBACKS)
+    text_endpoints = _endpoint_list(UAZAPI_SEND_TEXT_PATH or "/send/text", _TEXT_FALLBACKS)
     media_endpoints = _endpoint_list(UAZAPI_SEND_MEDIA_PATH or "/send/media", _MEDIA_FALLBACKS)
 
     headers = _headers()
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
         if type_ == "text" or not media_url:
-            # Tenta enviar texto priorizando chatId + @c.us
             for endpoint in text_endpoints:
                 for cid in _chatid_variants(phone):
                     candidates = [
-                        {"chatId": cid, "text": content},                    # padrão UazapiGo v2
-                        {"phone": _only_digits(cid), "text": content},        # algumas variações aceitam
+                        {"chatId": cid, "text": content},                    # padrão UazapiGo
+                        {"phone": _only_digits(cid), "text": content},        # variação aceita por alguns
                         {"number": _only_digits(cid), "message": content},    # variação estilo WPPConnect-like
                     ]
                     for payload in candidates:
@@ -147,7 +144,6 @@ async def send_whatsapp_message(
                                 except Exception:
                                     return {"status": "ok", "http_status": resp.status_code}
                             else:
-                                # log de diagnóstico leve (sem tokens)
                                 txt = resp.text[:200].replace("\n", " ")
                                 print(f"[uazapi] {endpoint} {resp.status_code} body={txt}")
                         except Exception as exc:
