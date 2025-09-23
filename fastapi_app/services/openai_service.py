@@ -6,8 +6,8 @@ Expõe:
 - ask_assistant(thread_id: str, user_message: str) -> Optional[str]
 
 Observações:
-- Usa Assistants v2 (requer header: OpenAI-Beta: assistants=v2).
-- Criação de thread correta: POST /v1/threads  (não é /assistants/{id}/threads).
+- Usa Assistants v2 (necessário header: OpenAI-Beta: assistants=v2).
+- Cria threads via POST /v1/threads; cada usuário tem o próprio thread_id.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def _headers() -> dict:
 
 async def get_or_create_thread(user: User, session: AsyncSession) -> str:
     """
-    Retorna o thread_id do usuário; cria um novo se não existir e persiste no banco.
+    Retorna o thread_id do usuário; cria um novo no OpenAI se não existir e salva no banco.
     """
     if user.thread_id:
         return user.thread_id
@@ -49,8 +49,7 @@ async def get_or_create_thread(user: User, session: AsyncSession) -> str:
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(f"{_BASE_URL}/threads", headers=_headers(), json={})
         resp.raise_for_status()
-        data = resp.json()
-        thread_id = data["id"]
+        thread_id = resp.json()["id"]
 
     user.thread_id = thread_id
     session.add(user)
@@ -61,23 +60,22 @@ async def get_or_create_thread(user: User, session: AsyncSession) -> str:
 
 async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
     """
-    Publica a mensagem do usuário na thread, cria um run e aguarda a conclusão.
-    Retorna o texto da resposta do assistente (se houver).
+    Publica a mensagem do usuário na thread, cria um run e aguarda conclusão.
+    Retorna o texto da resposta do assistente (ou None).
     """
     async with httpx.AsyncClient(timeout=60.0) as client:
-        # 1) mensagem do usuário
+        # Adiciona a mensagem do usuário
         try:
-            msg_resp = await client.post(
+            await client.post(
                 f"{_BASE_URL}/threads/{thread_id}/messages",
                 headers=_headers(),
                 json={"role": "user", "content": user_message},
             )
-            msg_resp.raise_for_status()
         except Exception as exc:
             print(f"[openai] erro ao postar mensagem do usuário: {exc}")
             return None
 
-        # 2) cria o run
+        # Cria o run
         try:
             run_resp = await client.post(
                 f"{_BASE_URL}/threads/{thread_id}/runs",
@@ -90,8 +88,8 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
             print(f"[openai] erro ao criar run: {exc}")
             return None
 
-        # 3) poll até completar
-        for _ in range(90):  # ~90s de timeout
+        # Acompanha status
+        for _ in range(90):
             try:
                 st = await client.get(
                     f"{_BASE_URL}/threads/{thread_id}/runs/{run_id}",
@@ -111,7 +109,7 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
             print("[openai] run não concluiu dentro do tempo limite.")
             return None
 
-        # 4) lê mensagens e extrai texto do assistente
+        # Lê mensagens e extrai texto
         try:
             msgs = await client.get(
                 f"{_BASE_URL}/threads/{thread_id}/messages",
@@ -124,11 +122,9 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
             print(f"[openai] erro ao buscar mensagens: {exc}")
             return None
 
-        # normalmente a API já retorna ordenado do mais recente p/ o mais antigo
         for m in data:
             if m.get("role") == "assistant":
                 contents = m.get("content", [])
-                # blocks: [{"type":"text","text":{"value":"..."}}]
                 if isinstance(contents, list):
                     for c in contents:
                         if c.get("type") == "text":
@@ -137,5 +133,4 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
                                 return txt
                 elif isinstance(contents, str):
                     return contents
-
         return None
