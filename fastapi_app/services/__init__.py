@@ -1,20 +1,21 @@
 """
 Service layer exports.
 
-This module re-exports helper functions so that other modules can import
-from fastapi_app.services without referencing individual submodules.
+Este módulo reexporta funções para uso em outros módulos.
 """
 
 from .uazapi_service import (
     send_whatsapp_message,
     send_message,
+    send_menu,              # novo export
     upload_file_to_baserow,
-)  # noqa: F401
-from .openai_service import get_or_create_thread, ask_assistant  # noqa: F401
+)
+from .openai_service import get_or_create_thread, ask_assistant
 
 __all__ = [
     "send_whatsapp_message",
     "send_message",
+    "send_menu",
     "upload_file_to_baserow",
     "get_or_create_thread",
     "ask_assistant",
