@@ -6,10 +6,11 @@ Expõe:
 - send_message(...) -> alias compatível (usa send_whatsapp_message)
 - upload_file_to_baserow(media_url) -> Optional[dict]
 
-Ajustes:
-- Garante que o primeiro endpoint tentado para texto seja SEMPRE '/send/text' (POST),
-  como prescrito no uazapiGO v2. Mantém fallbacks para outras rotas.
-- Header de autenticação padrão: 'token' (configurável por env).
+Ajustes nesta versão:
+- Para o endpoint '/send/text', prioriza payload {'number': '<digits>', 'text': '...'}.
+- Para o endpoint '/send/media', prioriza payload {'number': '<digits>', 'url': '...','caption': '...'}.
+- Mantém fallbacks (phone/chatId) para tolerar variações de instalações.
+- Garante '/send/text' como 1º endpoint tentado (depois env e outros fallbacks).
 """
 
 from __future__ import annotations
@@ -74,9 +75,9 @@ def _headers() -> Dict[str, str]:
 def _chatid_variants(phone: str) -> Iterable[str]:
     """
     Gera variantes para diferentes instalações:
-      1) <digits>@c.us   (prioridade)
+      1) <digits>@c.us   (prioridade para chatId)
       2) <digits>@s.whatsapp.net
-      3) <digits>        (fallback)
+      3) <digits>        (fallback simples)
     """
     digits = _only_digits(phone) or phone
     seen = set()
@@ -126,60 +127,79 @@ async def send_whatsapp_message(
 ) -> Dict[str, Any]:
     """
     Envia mensagem via Uazapi com múltiplas tentativas (endpoints/payloads).
-    Prioriza:
-      - endpoint de texto: /send/text  (POST)
-      - header: token (ou conforme env)
-      - payload: {"chatId": "<digits>@c.us", "text": "..."}
+    - Para '/send/text': prioriza {"number": "<digits>", "text": content}.
+    - Para '/send/media': prioriza {"number": "<digits>", "url": media_url, "caption": ...}.
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
 
     headers = _headers()
+    digits = _only_digits(phone) or phone
+
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
         if type_ == "text" or not media_url:
             for endpoint in _text_endpoints():
-                for cid in _chatid_variants(phone):
+                # Se for '/send/text', o formato preferido é number+text
+                if endpoint == "/send/text":
                     candidates = [
-                        {"chatId": cid, "text": content},                    # padrão uazapiGO v2
-                        {"phone": _only_digits(cid), "text": content},        # algumas variações aceitam
-                        {"number": _only_digits(cid), "message": content},    # WPPConnect-like
+                        {"number": digits, "text": content},                  # formato preferido (v2)
+                        {"phone": digits, "text": content},                   # variação aceita em algumas instalações
+                        {"chatId": f"{digits}@c.us", "text": content},        # fallback
                     ]
-                    for payload in candidates:
-                        try:
-                            resp = await client.post(endpoint, json=payload, headers=headers)
-                            if resp.status_code < 400:
-                                try:
-                                    return resp.json()
-                                except Exception:
-                                    return {"status": "ok", "http_status": resp.status_code}
-                            else:
-                                txt = resp.text[:200].replace("\n", " ")
-                                print(f"[uazapi] {endpoint} {resp.status_code} body={txt}")
-                        except Exception as exc:
-                            print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
+                else:
+                    # Para outras rotas, mantemos compatibilidade ampla
+                    candidates = []
+                    # chatId variants primeiro
+                    for cid in _chatid_variants(digits):
+                        candidates.append({"chatId": cid, "text": content})
+                    # phone/number variantes
+                    candidates.append({"phone": digits, "text": content})
+                    candidates.append({"number": digits, "text": content})
+
+                for payload in candidates:
+                    try:
+                        resp = await client.post(endpoint, json=payload, headers=headers)
+                        if resp.status_code < 400:
+                            try:
+                                return resp.json()
+                            except Exception:
+                                return {"status": "ok", "http_status": resp.status_code}
+                        else:
+                            txt = resp.text[:200].replace("\n", " ")
+                            print(f"[uazapi] {endpoint} {resp.status_code} body={txt}")
+                    except Exception as exc:
+                        print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
             raise RuntimeError(f"Uazapi text send failed for phone={phone}")
+
         else:
             mime = mime_type or _infer_mime_from_url(media_url)
             for endpoint in _media_endpoints():
-                for cid in _chatid_variants(phone):
+                if endpoint == "/send/media":
                     candidates = [
-                        {"chatId": cid, "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
-                        {"phone": _only_digits(cid), "url": media_url, "mimetype": mime, "caption": caption or content},
-                        {"number": _only_digits(cid), "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
+                        {"number": digits, "url": media_url, "caption": caption or content},     # preferido
+                        {"phone": digits, "url": media_url, "caption": caption or content},      # variação
+                        {"chatId": f"{digits}@c.us", "fileUrl": media_url, "mimeType": mime, "caption": caption or content},  # fallback
                     ]
-                    for payload in candidates:
-                        try:
-                            resp = await client.post(endpoint, json=payload, headers=headers)
-                            if resp.status_code < 400:
-                                try:
-                                    return resp.json()
-                                except Exception:
-                                    return {"status": "ok", "http_status": resp.status_code}
-                            else:
-                                txt = resp.text[:200].replace("\n", " ")
-                                print(f"[uazapi] {endpoint} {resp.status_code} body={txt}")
-                        except Exception as exc:
-                            print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
+                else:
+                    candidates = [
+                        {"chatId": f"{digits}@c.us", "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
+                        {"phone": digits, "url": media_url, "caption": caption or content},
+                        {"number": digits, "url": media_url, "caption": caption or content},
+                    ]
+
+                for payload in candidates:
+                    try:
+                        resp = await client.post(endpoint, json=payload, headers=headers)
+                        if resp.status_code < 400:
+                            try:
+                                return resp.json()
+                            except Exception:
+                                return {"status": "ok", "http_status": resp.status_code}
+                        else:
+                            txt = resp.text[:200].replace("\n", " ")
+                            print(f"[uazapi] {endpoint} {resp.status_code} body={txt}")
+                    except Exception as exc:
+                        print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
             raise RuntimeError(f"Uazapi media send failed for phone={phone}")
 
 # Alias de retrocompatibilidade
@@ -191,9 +211,8 @@ async def send_message(
     mime_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     if media_url:
-        mime = mime_type or _infer_mime_from_url(media_url)
         return await send_whatsapp_message(
-            phone=phone, content=text, type_="media", media_url=media_url, mime_type=mime, caption=text
+            phone=phone, content=text, type_="media", media_url=media_url, mime_type=mime_type, caption=text
         )
     return await send_whatsapp_message(phone=phone, content=text, type_="text")
 
