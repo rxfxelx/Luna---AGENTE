@@ -2,7 +2,7 @@
 Integração com OpenAI Assistants API v2.
 
 Expõe:
-- get_or_create_thread(user: User, session: AsyncSession) -> str
+- get_or_create_thread(session: AsyncSession, user: User) -> str
 - ask_assistant(thread_id: str, user_message: str) -> Optional[str]
 
 Observações:
@@ -39,9 +39,10 @@ def _headers() -> dict:
     }
 
 
-async def get_or_create_thread(user: User, session: AsyncSession) -> str:
+async def get_or_create_thread(session: AsyncSession, user: User) -> str:
     """
     Retorna o thread_id do usuário; cria um novo no OpenAI se não existir e salva no banco.
+    Assinatura correta: (session, user)
     """
     if user.thread_id:
         return user.thread_id
@@ -49,7 +50,10 @@ async def get_or_create_thread(user: User, session: AsyncSession) -> str:
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(f"{_BASE_URL}/threads", headers=_headers(), json={})
         resp.raise_for_status()
-        thread_id = resp.json()["id"]
+        data = resp.json()
+        thread_id = data.get("id")
+        if not thread_id:
+            raise RuntimeError("OpenAI não retornou 'id' do thread.")
 
     user.thread_id = thread_id
     session.add(user)
@@ -64,18 +68,26 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
     Retorna o texto da resposta do assistente (ou None).
     """
     async with httpx.AsyncClient(timeout=60.0) as client:
-        # Adiciona a mensagem do usuário
+        # 1) Adiciona a mensagem do usuário
         try:
-            await client.post(
+            # v2 aceita blocks; algumas contas ainda aceitam string simples.
+            # Tentamos blocks primeiro; se falhar, caímos para string.
+            r = await client.post(
                 f"{_BASE_URL}/threads/{thread_id}/messages",
                 headers=_headers(),
-                json={"role": "user", "content": user_message},
+                json={"role": "user", "content": [{"type": "text", "text": user_message}]},
             )
+            if r.status_code >= 400:
+                await client.post(
+                    f"{_BASE_URL}/threads/{thread_id}/messages",
+                    headers=_headers(),
+                    json={"role": "user", "content": user_message},
+                )
         except Exception as exc:
             print(f"[openai] erro ao postar mensagem do usuário: {exc}")
             return None
 
-        # Cria o run
+        # 2) Cria o run
         try:
             run_resp = await client.post(
                 f"{_BASE_URL}/threads/{thread_id}/runs",
@@ -83,13 +95,15 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
                 json={"assistant_id": ASSISTANT_ID},
             )
             run_resp.raise_for_status()
-            run_id = run_resp.json()["id"]
+            run_id = run_resp.json().get("id")
+            if not run_id:
+                return None
         except Exception as exc:
             print(f"[openai] erro ao criar run: {exc}")
             return None
 
-        # Acompanha status
-        for _ in range(90):
+        # 3) Acompanha status
+        for _ in range(90):  # ~90s
             try:
                 st = await client.get(
                     f"{_BASE_URL}/threads/{thread_id}/runs/{run_id}",
@@ -109,7 +123,7 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
             print("[openai] run não concluiu dentro do tempo limite.")
             return None
 
-        # Lê mensagens e extrai texto
+        # 4) Lê mensagens e extrai texto
         try:
             msgs = await client.get(
                 f"{_BASE_URL}/threads/{thread_id}/messages",
