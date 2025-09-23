@@ -30,6 +30,8 @@ from ..services.uazapi_service import send_whatsapp_message
 router = APIRouter(tags=["whatsapp-webhook"])
 
 
+# --------------------------- Auth helpers ---------------------------
+
 def _env_token() -> str:
     token = os.getenv("WEBHOOK_VERIFY_TOKEN", "")
     if not token:
@@ -56,6 +58,61 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Invalid webhook token")
 
 
+# --------------------------- Payload helpers ---------------------------
+
+_phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
+
+def _only_digits(s: str) -> str:
+    return "".join(ch for ch in s if ch.isdigit())
+
+def _norm_phone_from_jid(value: Any) -> Optional[str]:
+    """
+    Extrai telefone de um JID. Aceitamos:
+      - '<digits>@s.whatsapp.net'
+      - '<digits>@c.us'
+      - '<digits>' (apenas se tiver >= 10 dígitos)
+    Ignora grupos ('@g.us').
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if "@g.us" in v:
+        return None
+    if "@s.whatsapp.net" in v or "@c.us" in v:
+        return v.split("@")[0]
+    digits = _only_digits(v)
+    return digits if len(digits) >= 10 else None
+
+def _scan_for_phone(obj: Any) -> Optional[str]:
+    """
+    Fallback final: varre o JSON procurando padrões de telefone.
+    Preferência por strings com '@s.whatsapp.net' ou '@c.us'.
+    Depois tenta a 1ª sequência de 10-15 dígitos.
+    """
+    found_plain: Optional[str] = None
+
+    def walk(x: Any):
+        nonlocal found_plain
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+        elif isinstance(x, str):
+            if "@s.whatsapp.net" in x or "@c.us" in x:
+                p = x.split("@")[0]
+                if len(_only_digits(p)) >= 10:
+                    found_plain = p
+                    return
+            if not found_plain:
+                m = _phone_regex.search(x)
+                if m:
+                    found_plain = m.group(1)
+
+    walk(obj)
+    return _only_digits(found_plain) if found_plain else None
+
 def _deep_get(dct: Dict[str, Any], path: str, default=None):
     cur: Any = dct
     for part in path.split("."):
@@ -76,59 +133,74 @@ def _deep_get(dct: Dict[str, Any], path: str, default=None):
     return cur
 
 
-_phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
-
-
-def _only_digits(s: str) -> str:
-    return "".join(ch for ch in s if ch.isdigit())
-
-
-def _scan_for_phone(obj: Any) -> Optional[str]:
-    """
-    Varre o payload procurando algo que pareça telefone.
-    Preferência: strings com '@s.whatsapp.net' ou '@c.us'.
-    Fallback: primeira sequência de 10-15 dígitos.
-    """
-    found_plain: Optional[str] = None
-
-    def walk(x: Any):
-        nonlocal found_plain
-        if isinstance(x, dict):
-            for v in x.values():
-                walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk(v)
-        elif isinstance(x, str):
-            if "@s.whatsapp.net" in x or "@c.us" in x:
-                return x.split("@")[0]
-            if not found_plain:
-                m = _phone_regex.search(x)
-                if m:
-                    found_plain = m.group(1)
-
-    walk(obj)
-    if found_plain:
-        return _only_digits(found_plain)
-    return None
-
-
 def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     """
     Retorna: {"phone": str|None, "msg_type": str, "text": str|None}
-    Cobre formatos Baileys e variações simples do Uazapi.
+    - Prioriza JIDs corretos (key.remoteJid, chat.chatId, chat.remoteJid).
+    - NÃO usa chat.id se não tiver sufixo '@...' (evita IDs alfanuméricos).
+    - Se JID for de grupo (@g.us), tenta participant/author.
+    - Valida tamanho mínimo (>= 10 dígitos).
     """
-    # ---- Baileys-like deep message ----
+    # Mensagem "Baileys-like"
     msg = _deep_get(event, "data.data.messages.0") or _deep_get(event, "messages.0") or {}
     message_obj = msg.get("message", {}) if isinstance(msg, dict) else {}
 
-    # JID / phone (Baileys)
-    jid = _deep_get(msg, "key.remoteJid") or msg.get("remoteJid")
-    phone = None
-    if isinstance(jid, str):
-        phone = jid.split("@")[0] if "@s.whatsapp.net" in jid or "@c.us" in jid else _only_digits(jid)
+    # ---- Telefone / JID ----
+    phone: Optional[str] = None
 
-    # Text variants (Baileys)
+    # 1) JIDs canônicos
+    for p in (
+        _deep_get(msg, "key.remoteJid"),
+        msg.get("remoteJid") if isinstance(msg, dict) else None,
+        _deep_get(event, "chat.chatId"),
+        _deep_get(event, "chat.remoteJid"),
+        _deep_get(event, "key.remoteJid"),
+    ):
+        phone = _norm_phone_from_jid(p)
+        if phone:
+            break
+
+    # 2) Grupos: usar participant/author se remoteJid indicar grupo
+    is_group = False
+    for maybe in (_deep_get(msg, "key.remoteJid"), msg.get("remoteJid") if isinstance(msg, dict) else None):
+        if isinstance(maybe, str) and "@g.us" in maybe:
+            is_group = True
+            break
+    if not phone and is_group:
+        for p in (
+            _deep_get(msg, "key.participant"),
+            _deep_get(event, "participant"),
+            _deep_get(event, "author"),
+        ):
+            phone = _norm_phone_from_jid(p)
+            if phone:
+                break
+
+    # 3) Formatos simples do Uazapi (top-level)
+    if not phone:
+        for key in ("chatId", "from", "phone", "number"):
+            p = event.get(key)
+            cand = _norm_phone_from_jid(p)
+            if not cand and isinstance(p, str):
+                # aceitar só se tiver >=10 dígitos
+                digits = _only_digits(p)
+                cand = digits if len(digits) >= 10 else None
+            if cand:
+                phone = cand
+                break
+
+    # 4) NÃO usar chat.id a menos que tenha sufixo
+    if not phone:
+        p = _deep_get(event, "chat.id")
+        norm = _norm_phone_from_jid(p)  # só aceita se tiver @... ou >=10 dígitos
+        if norm:
+            phone = norm
+
+    # 5) Varredura completa (preferência @..., fallback regex 10-15 dígitos)
+    if not phone:
+        phone = _scan_for_phone(event)
+
+    # ---- Tipo e texto ----
     text: Optional[str] = None
     if isinstance(message_obj, dict):
         if "conversation" in message_obj:
@@ -158,39 +230,23 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
         else:
             msg_type = "unknown"
     else:
-        msg_type = "unknown"
+        # Uazapi simples
+        if isinstance(event.get("text"), str):
+            text = event.get("text")
+            msg_type = "text"
+        elif isinstance(event.get("message"), str):
+            text = event.get("message")
+            msg_type = "text"
+        else:
+            msg_type = "unknown"
 
-    # ---- Uazapi shapes: tenta chaves comuns no topo e dentro de 'chat' ----
-    # Texto em chaves comuns
-    if not text and isinstance(event.get("text"), str):
-        text = event.get("text")
-        msg_type = "text"
-    if not text and isinstance(event.get("message"), str):
-        text = event["message"]
-        msg_type = "text"
-    if not text and isinstance(_deep_get(event, "chat.lastText"), str):
-        text = _deep_get(event, "chat.lastText")
-        msg_type = "text"
-
-    # Número em chaves comuns
-    for key in ("phone", "number", "from", "chatId"):
-        if not phone and isinstance(event.get(key), str):
-            v = event[key]
-            phone = v.split("@")[0] if "@s.whatsapp.net" in v or "@c.us" in v else _only_digits(v)
-
-    # Número dentro de 'chat'
-    for path in ("chat.chatId", "chat.remoteJid", "chat.jid", "chat.id", "chat.from"):
-        if not phone:
-            v = _deep_get(event, path)
-            if isinstance(v, str):
-                phone = v.split("@")[0] if "@s.whatsapp.net" in v or "@c.us" in v else _only_digits(v)
-
-    # Fallback final: varre tudo
-    if not phone:
-        phone = _scan_for_phone(event)
-
-    if not msg_type:
-        msg_type = "unknown"
+    # Validação final do número
+    if phone:
+        digits = _only_digits(phone)
+        if len(digits) < 10:
+            sample = str(event)[:200]
+            print(f"[webhook] phone_too_short extracted={phone} sample={sample}")
+            phone = None  # força o ACK sem reply para evitar enviar errado
 
     return {"phone": phone, "msg_type": msg_type, "text": text}
 
@@ -206,7 +262,8 @@ async def _get_or_create_user(session: AsyncSession, phone: str, name: Optional[
     return user
 
 
-# ========== Accept both '' and '/' (avoid redirects) ==========
+# ================== endpoints ('' e '/') para evitar 307 ==================
+
 @router.head("")
 @router.head("/")
 async def head_check(
@@ -278,7 +335,6 @@ async def webhook_post(
     await db.commit()
 
     try:
-        # Envio tolerante a variações do Uazapi
         await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
     except Exception as e:
         print(f"[uazapi] send failed: {e!r}")
