@@ -1,24 +1,20 @@
 """
 Webhook and API endpoints for WhatsApp interactions (Uazapi).
 
-This router is mounted under a configurable prefix (WEBHOOK_PATH),
-and exposes:
-  - HEAD   /   -> quick auth check (requires token)
-  - GET    /   -> verify endpoint (supports ?token=..., and Meta-style hub.challenge)
-  - POST   /   -> webhook receiver (requires token), processes messages
+Mounted under WEBHOOK_PATH. Now accepts both `/prefix` and `/prefix/`
+(no redirect) for HEAD/GET/POST to avoid 307 issues with some clients.
 
 Auth:
-- Provide a shared secret in env WEBHOOK_VERIFY_TOKEN.
-- We accept it via:
-    * Query:  ?token=YOUR_TOKEN
-    * Header: X-Webhook-Token: YOUR_TOKEN
-    * Meta-style: hub.verify_token=YOUR_TOKEN (GET only)
+- Shared secret via env WEBHOOK_VERIFY_TOKEN, accepted as:
+  * Query:  ?token=YOUR_TOKEN
+  * Header: X-Webhook-Token: YOUR_TOKEN
+  * Meta-style (GET only): hub.verify_token=YOUR_TOKEN
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -65,36 +61,6 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Invalid webhook token")
 
 
-@router.head("/")
-async def head_check(
-    request: Request,
-    x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token"),
-) -> Response:
-    _ensure_authorised(request, x_webhook_token)
-    return Response(status_code=200)
-
-
-@router.get("/")
-async def get_verify(
-    request: Request,
-    x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token"),
-) -> Response:
-    """
-    Supports two verification styles:
-    - Simple token check:  GET /?token=YOUR_TOKEN  -> {"ok": true}
-    - Meta-style hub.challenge:
-        GET /?hub.mode=subscribe&hub.verify_token=YOUR_TOKEN&hub.challenge=XYZ -> returns 'XYZ'
-    """
-    _ensure_authorised(request, x_webhook_token)
-
-    # Meta-style handshake
-    hub_challenge = request.query_params.get("hub.challenge")
-    if hub_challenge is not None:
-        return PlainTextResponse(hub_challenge, status_code=200, media_type="text/plain")
-
-    return JSONResponse({"ok": True})
-
-
 def _deep_get(dct: Dict[str, Any], path: str, default=None):
     """
     Safe nested key access using dot-path (e.g. "data.data.messages.0.message").
@@ -120,39 +86,70 @@ def _deep_get(dct: Dict[str, Any], path: str, default=None):
 
 def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     """
-    Try to be resilient to different shapes (Baileys/Uazapi variations).
-    Returns dict with keys: phone, msg_type, text (when applicable)
+    Resilient extraction for common Uazapi/Baileys shapes.
+    Returns: {"phone": str|None, "msg_type": str, "text": str|None}
     """
+    # ---- Baileys-like deep message ----
     msg = _deep_get(event, "data.data.messages.0") or _deep_get(event, "messages.0") or {}
     message_obj = msg.get("message", {}) if isinstance(msg, dict) else {}
-    # phone (remoteJid style: "5511999999999@s.whatsapp.net")
-    jid = _deep_get(msg, "key.remoteJid") or msg.get("remoteJid")
-    phone = jid.split("@")[0] if isinstance(jid, str) and "@s.whatsapp.net" in jid else jid
 
-    # text variants
+    # JID / phone
+    jid = _deep_get(msg, "key.remoteJid") or msg.get("remoteJid")
+    phone = None
+    if isinstance(jid, str):
+        phone = jid.split("@")[0] if "@s.whatsapp.net" in jid else jid
+
+    # Text variants (Baileys)
     text: Optional[str] = None
-    if "conversation" in message_obj:
-        text = message_obj.get("conversation")
-        msg_type = "text"
-    elif "extendedTextMessage" in message_obj:
-        text = message_obj["extendedTextMessage"].get("text")
-        msg_type = "text"
-    elif "textMessage" in message_obj:
-        # alguns payloads podem colocar diretamente a string
-        raw = message_obj.get("textMessage")
-        text = raw if isinstance(raw, str) else (raw.get("text") if isinstance(raw, dict) else None)
-        msg_type = "text"
-    elif "imageMessage" in message_obj:
-        msg_type = "image"
-    elif "videoMessage" in message_obj:
-        msg_type = "video"
-    elif "audioMessage" in message_obj:
-        msg_type = "audio"
-    elif "documentMessage" in message_obj:
-        msg_type = "pdf"
-    elif "contactMessage" in message_obj or "contactsArrayMessage" in message_obj or "contacts" in message_obj:
-        msg_type = "vcard"
+    if isinstance(message_obj, dict):
+        if "conversation" in message_obj:
+            text = message_obj.get("conversation")
+            msg_type = "text"
+        elif "extendedTextMessage" in message_obj:
+            text = message_obj["extendedTextMessage"].get("text")
+            msg_type = "text"
+        elif "textMessage" in message_obj:
+            raw = message_obj.get("textMessage")
+            text = raw if isinstance(raw, str) else (raw.get("text") if isinstance(raw, dict) else None)
+            msg_type = "text"
+        elif "imageMessage" in message_obj:
+            msg_type = "image"
+        elif "videoMessage" in message_obj:
+            msg_type = "video"
+        elif "audioMessage" in message_obj:
+            msg_type = "audio"
+        elif "documentMessage" in message_obj:
+            msg_type = "pdf"
+        elif (
+            "contactMessage" in message_obj
+            or "contactsArrayMessage" in message_obj
+            or "contacts" in message_obj
+        ):
+            msg_type = "vcard"
+        else:
+            msg_type = "unknown"
     else:
+        msg_type = "unknown"
+
+    # ---- Uazapi simple shapes (fallbacks) ----
+    # Top-level text
+    if not text and isinstance(event.get("text"), str):
+        text = event.get("text")
+        msg_type = "text"
+
+    # Common number/phone keys
+    for key in ("phone", "number", "from", "chatId"):
+        if not phone and isinstance(event.get(key), str):
+            value = event[key]
+            phone = value.split("@")[0] if "@s.whatsapp.net" in value else value
+
+    # Another frequent wrapper: {"message": "oi", "phone": "..."}
+    if not text and isinstance(event.get("message"), str):
+        text = event["message"]
+        msg_type = "text"
+
+    # Final fallback
+    if not msg_type:
         msg_type = "unknown"
 
     return {"phone": phone, "msg_type": msg_type, "text": text}
@@ -169,6 +166,48 @@ async def _get_or_create_user(session: AsyncSession, phone: str, name: Optional[
     return user
 
 
+# =========================
+# HEAD  -> accept both '' and '/'
+# =========================
+@router.head("")
+@router.head("/")
+async def head_check(
+    request: Request,
+    x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token"),
+) -> Response:
+    _ensure_authorised(request, x_webhook_token)
+    return Response(status_code=200)
+
+
+# =========================
+# GET   -> accept both '' and '/'
+# =========================
+@router.get("")
+@router.get("/")
+async def get_verify(
+    request: Request,
+    x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token"),
+) -> Response:
+    """
+    Supports two verification styles:
+    - Simple token check:  GET /?token=YOUR_TOKEN  -> {"ok": true}
+    - Meta-style hub.challenge:
+        GET /?hub.mode=subscribe&hub.verify_token=YOUR_TOKEN&hub.challenge=XYZ -> returns 'XYZ'
+    """
+    _ensure_authorised(request, x_webhook_token)
+
+    # Meta-style handshake
+    hub_challenge = request.query_params.get("hub.challenge")
+    if hub_challenge is not None:
+        return PlainTextResponse(hub_challenge, status_code=200, media_type="text/plain")
+
+    return JSONResponse({"ok": True})
+
+
+# =========================
+# POST  -> accept both '' and '/'
+# =========================
+@router.post("")
 @router.post("/")
 async def webhook_post(
     request: Request,
@@ -195,7 +234,9 @@ async def webhook_post(
     text = info.get("text")
 
     if not phone:
-        # still ack to avoid retries
+        # Log pequeno para debug de payload desconhecido
+        sample = str(payload)[:300]
+        print(f"[webhook] no phone extracted; sample={sample}")
         return JSONResponse({"received": True, "note": "no phone"}, status_code=200)
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
