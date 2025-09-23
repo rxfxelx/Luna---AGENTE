@@ -13,6 +13,7 @@ Auth:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from typing import Any, Dict, Optional
@@ -22,7 +23,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db import get_db
+from ..db import get_db, SessionLocal
 from ..models.db_models import Message, User
 from ..services.openai_service import ask_assistant, get_or_create_thread
 from ..services.uazapi_service import send_whatsapp_message
@@ -63,12 +64,12 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
 TEXT_KEYS_PRIORITY = (
-    # caminhos mais comuns (Baileys-like)
+    # Baileys-like
     "data.data.messages.0.message.conversation",
     "data.data.messages.0.message.extendedTextMessage.text",
     "messages.0.message.conversation",
     "messages.0.message.extendedTextMessage.text",
-    # variações simples do Uazapi
+    # Uazapi simples
     "messages.0.text",
     "data.text",
     "data.message",
@@ -104,11 +105,8 @@ def _deep_get(dct: Dict[str, Any], path: str, default=None):
 
 def _norm_phone_from_jid(value: Any) -> Optional[str]:
     """
-    Aceita:
-      - '<digits>@s.whatsapp.net'
-      - '<digits>@c.us'
-      - '<digits>' (>=10 dígitos)
-    Ignora grupos ('@g.us').
+    '<digits>@s.whatsapp.net' | '<digits>@c.us' | '<digits>' (>=10)
+    Ignora grupos '@g.us'.
     """
     if not isinstance(value, str):
         return None
@@ -121,9 +119,6 @@ def _norm_phone_from_jid(value: Any) -> Optional[str]:
     return digits if len(digits) >= 10 else None
 
 def _scan_for_phone(obj: Any) -> Optional[str]:
-    """
-    Varredura final por número (prefere JID, depois regex 10-15 dígitos).
-    """
     found_plain: Optional[str] = None
 
     def walk(x: Any):
@@ -144,22 +139,16 @@ def _scan_for_phone(obj: Any) -> Optional[str]:
                 m = _phone_regex.search(x)
                 if m:
                     found_plain = m.group(1)
-
     walk(obj)
     return _only_digits(found_plain) if found_plain else None
 
 def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
-    """
-    Procura texto em caminhos conhecidos e, se não achar, varre por chaves típicas.
-    """
     for path in TEXT_KEYS_PRIORITY:
         val = _deep_get(event, path)
         if isinstance(val, str) and val.strip():
             return val.strip()
-
     keys = {"text", "message", "body", "content", "caption", "conversation"}
     found: Optional[str] = None
-
     def walk(x: Any):
         nonlocal found
         if found:
@@ -173,15 +162,10 @@ def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
         elif isinstance(x, list):
             for v in x:
                 walk(v)
-
     walk(event)
     return found
 
 def _is_from_me(event: Dict[str, Any]) -> bool:
-    """
-    Detecta mensagens enviadas pelo próprio número/bot para evitar loop.
-    Checa várias formas: key.fromMe, fromMe, message?.fromMe, etc.
-    """
     for path in (
         "data.data.messages.0.key.fromMe",
         "messages.0.key.fromMe",
@@ -195,17 +179,10 @@ def _is_from_me(event: Dict[str, Any]) -> bool:
     return False
 
 def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    """
-    Retorna: {"phone": str|None, "msg_type": str, "text": str|None}
-    """
-    # Mensagem "Baileys-like"
     msg = _deep_get(event, "data.data.messages.0") or _deep_get(event, "messages.0") or {}
     message_obj = msg.get("message", {}) if isinstance(msg, dict) else {}
 
-    # ---- Telefone / JID ----
     phone: Optional[str] = None
-
-    # 1) JIDs canônicos
     for p in (
         _deep_get(msg, "key.remoteJid"),
         msg.get("remoteJid") if isinstance(msg, dict) else None,
@@ -217,7 +194,6 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
         if phone:
             break
 
-    # 2) Grupos: usar participant/author se for @g.us
     is_group = False
     for maybe in (_deep_get(msg, "key.remoteJid"), msg.get("remoteJid") if isinstance(msg, dict) else None):
         if isinstance(maybe, str) and "@g.us" in maybe:
@@ -229,7 +205,6 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
             if phone:
                 break
 
-    # 3) Formatos simples do Uazapi (top-level)
     if not phone:
         for key in ("chatId", "from", "phone", "number"):
             p = event.get(key)
@@ -241,24 +216,20 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
                 phone = cand
                 break
 
-    # 4) NÃO usar chat.id sem sufixo
     if not phone:
         p = _deep_get(event, "chat.id")
         norm = _norm_phone_from_jid(p)
         if norm:
             phone = norm
 
-    # 5) Varredura completa
     if not phone:
         phone = _scan_for_phone(event)
 
-    # ---- Texto / Tipo ----
     text = _extract_text_generic(event)
 
     if text:
         msg_type = "text"
     else:
-        # detectar mídia básica
         if _deep_get(event, "data.data.messages.0.message.imageMessage") or event.get("image"):
             msg_type = "image"
         elif _deep_get(event, "data.data.messages.0.message.videoMessage") or event.get("video"):
@@ -270,7 +241,6 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
         else:
             msg_type = "unknown"
 
-    # Validação final do número
     if phone:
         digits = _only_digits(phone)
         if len(digits) < 10:
@@ -316,6 +286,33 @@ async def get_verify(
     return JSONResponse({"ok": True})
 
 
+async def _process_message_async(phone: str, msg_type: str, text: Optional[str], push_name: Optional[str]) -> None:
+    """Processa a mensagem fora do ciclo do request para evitar timeouts/499."""
+    try:
+        async with SessionLocal() as session:  # nova sessão
+            user = await _get_or_create_user(session, phone=phone, name=push_name)
+
+            if msg_type == "text" and text:
+                thread_id = await get_or_create_thread(session, user)  # (session, user)
+                reply_text = await ask_assistant(thread_id, text) or "Desculpe, não consegui processar sua mensagem agora."
+            else:
+                reply_text = "Arquivo recebido com sucesso. Já estou processando! ✅"
+
+            # salva mensagem do assistant
+            out_msg = Message(user_id=user.id, sender="assistant", content=reply_text, media_type="text")
+            session.add(out_msg)
+            await session.commit()
+
+            # envia via Uazapi
+            try:
+                await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
+            except Exception as e:
+                print(f"[uazapi] send failed (bg): {e!r}")
+
+    except Exception as exc:
+        print(f"[bg] unexpected error: {exc!r}")
+
+
 @router.post("")
 @router.post("/")
 async def webhook_post(
@@ -330,7 +327,7 @@ async def webhook_post(
     except Exception:
         return JSONResponse({"received": False, "reason": "invalid JSON"}, status_code=200)
 
-    # Ignora mensagens do próprio bot para evitar loop
+    # Ignora mensagens do próprio bot (evita loop)
     if _is_from_me(payload):
         return JSONResponse({"received": True, "note": "from_me"}, status_code=200)
 
@@ -339,7 +336,6 @@ async def webhook_post(
     msg_type = info.get("msg_type")
     text = info.get("text")
 
-    # Log leve para diagnóstico (sem dados sensíveis)
     print(f"[webhook] extracted phone={phone} type={msg_type} text_len={(len(text) if text else 0)}")
 
     if not phone:
@@ -347,9 +343,9 @@ async def webhook_post(
         return JSONResponse({"received": True, "note": "no phone"}, status_code=200)
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
-    user = await _get_or_create_user(db, phone=phone, name=push_name)
 
-    # Save incoming message
+    # registra a mensagem recebida (entrada) rapidamente
+    user = await _get_or_create_user(db, phone=phone, name=push_name)
     in_msg = Message(
         user_id=user.id,
         sender="user",
@@ -360,22 +356,8 @@ async def webhook_post(
     db.add(in_msg)
     await db.commit()
 
-    if msg_type == "text" and text:
-        # ORDEM CORRETA: (session, user)
-        thread_id = await get_or_create_thread(db, user)
-        reply_text = await ask_assistant(thread_id, text) or "Desculpe, não consegui processar sua mensagem agora."
-    else:
-        reply_text = "Arquivo recebido com sucesso. Já estou processando! ✅"
-
-    out_msg = Message(user_id=user.id, sender="assistant", content=reply_text, media_type="text")
-    db.add(out_msg)
-    await db.commit()
-
-    try:
-        await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
-    except Exception as e:
-        print(f"[uazapi] send failed: {e!r}")
-
+    # dispara processamento em background e ACK imediato
+    asyncio.create_task(_process_message_async(phone=phone, msg_type=msg_type or "unknown", text=text, push_name=push_name))
     return JSONResponse({"received": True}, status_code=200)
 
 
