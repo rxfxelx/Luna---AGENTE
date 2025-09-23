@@ -213,7 +213,6 @@ async def webhook_post(
     await db.commit()
 
     # Decide what to do
-    reply_text: Optional[str] = None
     if msg_type == "text" and text:
         # Ask OpenAI
         thread_id = await get_or_create_thread(user, db)  # persist thread_id no user
