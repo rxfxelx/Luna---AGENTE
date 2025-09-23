@@ -1,14 +1,13 @@
 """
-Webhook and API endpoints for WhatsApp interactions (Uazapi).
+Webhook e endpoints para integrações WhatsApp (Uazapi).
 
-Mounted under WEBHOOK_PATH. Accepts both `/prefix` and `/prefix/`
-(no redirect) for HEAD/GET/POST.
+- Montado sob WEBHOOK_PATH.
+- HEAD/GET: verificação (com token).
+- POST: recebe webhook, persiste mensagem, processa em background e responde 200 rápido.
 
-Auth:
-- Shared secret via env WEBHOOK_VERIFY_TOKEN, accepted as:
-  * Query:  ?token=YOUR_TOKEN
-  * Header: X-Webhook-Token: YOUR_TOKEN
-  * Meta-style (GET only): hub.verify_token=YOUR_TOKEN
+Anti‑loop: ignora mensagens 'fromMe'.
+Extração de telefone: JIDs + varredura.
+Menu opcional: se habilitado via ENV, envia /send/menu quando detectar confirmação curta.
 """
 
 from __future__ import annotations
@@ -26,31 +25,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db import get_db, SessionLocal
 from ..models.db_models import Message, User
 from ..services.openai_service import ask_assistant, get_or_create_thread
-from ..services.uazapi_service import send_whatsapp_message
+from ..services.uazapi_service import send_whatsapp_message, send_menu
 
 router = APIRouter(tags=["whatsapp-webhook"])
 
+# ---------------- ENV de menu/botões ----------------
+AUTO_MENU_IF_POSITIVE = os.getenv("UAZAPI_AUTO_MENU_IF_POSITIVE", "true").lower() == "true"
+MENU_TEXT = os.getenv("UAZAPI_MENU_TEXT", "Posso te mostrar rapidamente um exemplo objetivo do que fazemos?")
+MENU_CHOICES = [opt.strip() for opt in os.getenv(
+    "UAZAPI_MENU_CHOICES", "Sim, pode continuar|Não, encerrar contato"
+).split("|") if opt.strip()]
+MENU_FOOTER = os.getenv("UAZAPI_MENU_FOOTER", "Escolha uma das opções abaixo")
+MENU_POSITIVE_WORDS = [w.strip().lower() for w in os.getenv(
+    "UAZAPI_MENU_POSITIVE_WORDS", "sim|ok|claro|pode|pode continuar|quero|sou eu"
+).split("|") if w.strip()]
 
-# --------------------------- Auth helpers ---------------------------
-
+# ---------------- Auth helpers ----------------
 def _env_token() -> str:
     token = os.getenv("WEBHOOK_VERIFY_TOKEN", "")
     if not token:
-        print("[warn] WEBHOOK_VERIFY_TOKEN is not set; webhook will accept any request if token not enforced.")
+        print("[warn] WEBHOOK_VERIFY_TOKEN não definido.")
     return token
-
 
 def _extract_token_from_request(request: Request, header_token: Optional[str]) -> Optional[str]:
     if header_token:
         return header_token
-    q_token = request.query_params.get("token")
-    if q_token:
-        return q_token
-    q_hub = request.query_params.get("hub.verify_token")
-    if q_hub:
-        return q_hub
-    return None
-
+    return request.query_params.get("token") or request.query_params.get("hub.verify_token")
 
 def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
     expected = _env_token()
@@ -58,9 +58,7 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
     if expected and provided != expected:
         raise HTTPException(status_code=403, detail="Invalid webhook token")
 
-
-# --------------------------- Payload helpers ---------------------------
-
+# ---------------- Payload helpers ----------------
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
 TEXT_KEYS_PRIORITY = (
@@ -104,10 +102,7 @@ def _deep_get(dct: Dict[str, Any], path: str, default=None):
     return cur
 
 def _norm_phone_from_jid(value: Any) -> Optional[str]:
-    """
-    '<digits>@s.whatsapp.net' | '<digits>@c.us' | '<digits>' (>=10)
-    Ignora grupos '@g.us'.
-    """
+    """Extrai <digits> de '<digits>@s.whatsapp.net' | '<digits>@c.us' | '<digits>' (>=10). Ignora grupos."""
     if not isinstance(value, str):
         return None
     v = value.strip()
@@ -120,7 +115,6 @@ def _norm_phone_from_jid(value: Any) -> Optional[str]:
 
 def _scan_for_phone(obj: Any) -> Optional[str]:
     found_plain: Optional[str] = None
-
     def walk(x: Any):
         nonlocal found_plain
         if isinstance(x, dict):
@@ -225,8 +219,8 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     if not phone:
         phone = _scan_for_phone(event)
 
+    # tipo/texto
     text = _extract_text_generic(event)
-
     if text:
         msg_type = "text"
     else:
@@ -241,15 +235,13 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
         else:
             msg_type = "unknown"
 
-    if phone:
-        digits = _only_digits(phone)
-        if len(digits) < 10:
-            print(f"[webhook] phone_too_short extracted={phone} sample={str(event)[:200]}")
-            phone = None
+    if phone and len(_only_digits(phone)) < 10:
+        print(f"[webhook] phone_too_short extracted={phone} sample={str(event)[:200]}")
+        phone = None
 
     return {"phone": phone, "msg_type": msg_type, "text": text}
 
-
+# ---------------- DB helpers ----------------
 async def _get_or_create_user(session: AsyncSession, phone: str, name: Optional[str]) -> User:
     res = await session.execute(select(User).where(User.phone == phone))
     user = res.scalar_one_or_none()
@@ -260,59 +252,63 @@ async def _get_or_create_user(session: AsyncSession, phone: str, name: Optional[
         await session.refresh(user)
     return user
 
-
-# ================== endpoints ('' e '/') para evitar 307 ==================
-
+# ---------------- HEAD/GET sem redirect ----------------
 @router.head("")
 @router.head("/")
-async def head_check(
-    request: Request,
-    x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token"),
-) -> Response:
+async def head_check(request: Request, x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token")) -> Response:
     _ensure_authorised(request, x_webhook_token)
     return Response(status_code=200)
 
-
 @router.get("")
 @router.get("/")
-async def get_verify(
-    request: Request,
-    x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token"),
-) -> Response:
+async def get_verify(request: Request, x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token")) -> Response:
     _ensure_authorised(request, x_webhook_token)
     hub_challenge = request.query_params.get("hub.challenge")
     if hub_challenge is not None:
         return PlainTextResponse(hub_challenge, status_code=200, media_type="text/plain")
     return JSONResponse({"ok": True})
 
-
+# ---------------- Background worker ----------------
 async def _process_message_async(phone: str, msg_type: str, text: Optional[str], push_name: Optional[str]) -> None:
-    """Processa a mensagem fora do ciclo do request para evitar timeouts/499."""
+    """Processa fora do request para evitar timeouts (499)."""
     try:
-        async with SessionLocal() as session:  # nova sessão
+        async with SessionLocal() as session:
             user = await _get_or_create_user(session, phone=phone, name=push_name)
 
-            if msg_type == "text" and text:
-                thread_id = await get_or_create_thread(session, user)  # (session, user)
-                reply_text = await ask_assistant(thread_id, text) or "Desculpe, não consegui processar sua mensagem agora."
-            else:
-                reply_text = "Arquivo recebido com sucesso. Já estou processando! ✅"
+            # Menu automático por ENV para confirmações curtas
+            sent_menu = False
+            if AUTO_MENU_IF_POSITIVE and msg_type == "text" and text:
+                low = text.strip().lower()
+                if any(p in low for p in MENU_POSITIVE_WORDS):
+                    try:
+                        await send_menu(phone=phone, text=MENU_TEXT, choices=MENU_CHOICES, footer=MENU_FOOTER)
+                        out_menu = Message(user_id=user.id, sender="assistant", content=MENU_TEXT, media_type="text")
+                        session.add(out_menu)
+                        await session.commit()
+                        sent_menu = True
+                    except Exception as e:
+                        print(f"[uazapi] send_menu failed: {e!r}")
 
-            # salva mensagem do assistant
-            out_msg = Message(user_id=user.id, sender="assistant", content=reply_text, media_type="text")
-            session.add(out_msg)
-            await session.commit()
+            if not sent_menu:
+                if msg_type == "text" and text:
+                    thread_id = await get_or_create_thread(session, user)  # (session, user)
+                    reply_text = await ask_assistant(thread_id, text) or "Desculpe, não consegui processar sua mensagem agora."
+                else:
+                    reply_text = "Arquivo recebido com sucesso. Já estou processando! ✅"
 
-            # envia via Uazapi
-            try:
-                await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
-            except Exception as e:
-                print(f"[uazapi] send failed (bg): {e!r}")
+                out_msg = Message(user_id=user.id, sender="assistant", content=reply_text, media_type="text")
+                session.add(out_msg)
+                await session.commit()
+
+                try:
+                    await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
+                except Exception as e:
+                    print(f"[uazapi] send failed (bg): {e!r}")
 
     except Exception as exc:
         print(f"[bg] unexpected error: {exc!r}")
 
-
+# ---------------- POST webhook ----------------
 @router.post("")
 @router.post("/")
 async def webhook_post(
@@ -327,13 +323,13 @@ async def webhook_post(
     except Exception:
         return JSONResponse({"received": False, "reason": "invalid JSON"}, status_code=200)
 
-    # Ignora mensagens do próprio bot (evita loop)
+    # Evita loop
     if _is_from_me(payload):
         return JSONResponse({"received": True, "note": "from_me"}, status_code=200)
 
     info = _extract_sender_and_type(payload)
     phone = info.get("phone")
-    msg_type = info.get("msg_type")
+    msg_type = info.get("msg_type") or "unknown"
     text = info.get("text")
 
     print(f"[webhook] extracted phone={phone} type={msg_type} text_len={(len(text) if text else 0)}")
@@ -344,22 +340,21 @@ async def webhook_post(
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
 
-    # registra a mensagem recebida (entrada) rapidamente
+    # registra entrada rapidamente
     user = await _get_or_create_user(db, phone=phone, name=push_name)
     in_msg = Message(
         user_id=user.id,
         sender="user",
         content=text if msg_type == "text" else None,
-        media_type=msg_type or "unknown",
+        media_type=msg_type,
         media_url=None,
     )
     db.add(in_msg)
     await db.commit()
 
-    # dispara processamento em background e ACK imediato
-    asyncio.create_task(_process_message_async(phone=phone, msg_type=msg_type or "unknown", text=text, push_name=push_name))
+    # processa em background e responde 200 imediato
+    asyncio.create_task(_process_message_async(phone=phone, msg_type=msg_type, text=text, push_name=push_name))
     return JSONResponse({"received": True}, status_code=200)
-
 
 def get_router() -> APIRouter:
     return router
