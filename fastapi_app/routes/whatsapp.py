@@ -62,8 +62,44 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
 
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
+TEXT_KEYS_PRIORITY = (
+    # caminhos mais comuns
+    "data.data.messages.0.message.conversation",
+    "data.data.messages.0.message.extendedTextMessage.text",
+    "messages.0.message.conversation",
+    "messages.0.message.extendedTextMessage.text",
+    # formatos simples do Uazapi
+    "data.text",
+    "data.message",
+    "data.body",
+    "text",
+    "message",
+    "body",
+    "content",
+    "caption",
+)
+
 def _only_digits(s: str) -> str:
     return "".join(ch for ch in s if ch.isdigit())
+
+def _deep_get(dct: Dict[str, Any], path: str, default=None):
+    cur: Any = dct
+    for part in path.split("."):
+        if isinstance(cur, list):
+            try:
+                idx = int(part)
+            except Exception:
+                return default
+            if idx < 0 or idx >= len(cur):
+                return default
+            cur = cur[idx]
+        elif isinstance(cur, dict):
+            if part not in cur:
+                return default
+            cur = cur[part]
+        else:
+            return default
+    return cur
 
 def _norm_phone_from_jid(value: Any) -> Optional[str]:
     """
@@ -113,24 +149,36 @@ def _scan_for_phone(obj: Any) -> Optional[str]:
     walk(obj)
     return _only_digits(found_plain) if found_plain else None
 
-def _deep_get(dct: Dict[str, Any], path: str, default=None):
-    cur: Any = dct
-    for part in path.split("."):
-        if isinstance(cur, list):
-            try:
-                idx = int(part)
-            except Exception:
-                return default
-            if idx < 0 or idx >= len(cur):
-                return default
-            cur = cur[idx]
-        elif isinstance(cur, dict):
-            if part not in cur:
-                return default
-            cur = cur[part]
-        else:
-            return default
-    return cur
+def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
+    """
+    Procura texto em múltiplos caminhos conhecidos e, por fim,
+    varre o JSON por chaves relevantes.
+    """
+    for path in TEXT_KEYS_PRIORITY:
+        val = _deep_get(event, path)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    # varredura ampla por chaves típicas
+    keys = {"text", "message", "body", "content", "caption", "conversation"}
+    found: Optional[str] = None
+
+    def walk(x: Any):
+        nonlocal found
+        if found:
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if isinstance(v, str) and k.lower() in keys and v.strip():
+                    found = v.strip()
+                    return
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    walk(event)
+    return found
 
 
 def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
@@ -182,7 +230,6 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
             p = event.get(key)
             cand = _norm_phone_from_jid(p)
             if not cand and isinstance(p, str):
-                # aceitar só se tiver >=10 dígitos
                 digits = _only_digits(p)
                 cand = digits if len(digits) >= 10 else None
             if cand:
@@ -192,7 +239,7 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     # 4) NÃO usar chat.id a menos que tenha sufixo
     if not phone:
         p = _deep_get(event, "chat.id")
-        norm = _norm_phone_from_jid(p)  # só aceita se tiver @... ou >=10 dígitos
+        norm = _norm_phone_from_jid(p)
         if norm:
             phone = norm
 
@@ -200,43 +247,21 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     if not phone:
         phone = _scan_for_phone(event)
 
-    # ---- Tipo e texto ----
-    text: Optional[str] = None
-    if isinstance(message_obj, dict):
-        if "conversation" in message_obj:
-            text = message_obj.get("conversation")
-            msg_type = "text"
-        elif "extendedTextMessage" in message_obj:
-            text = message_obj["extendedTextMessage"].get("text")
-            msg_type = "text"
-        elif "textMessage" in message_obj:
-            raw = message_obj.get("textMessage")
-            text = raw if isinstance(raw, str) else (raw.get("text") if isinstance(raw, dict) else None)
-            msg_type = "text"
-        elif "imageMessage" in message_obj:
-            msg_type = "image"
-        elif "videoMessage" in message_obj:
-            msg_type = "video"
-        elif "audioMessage" in message_obj:
-            msg_type = "audio"
-        elif "documentMessage" in message_obj:
-            msg_type = "pdf"
-        elif (
-            "contactMessage" in message_obj
-            or "contactsArrayMessage" in message_obj
-            or "contacts" in message_obj
-        ):
-            msg_type = "vcard"
-        else:
-            msg_type = "unknown"
+    # ---- Texto / Tipo ----
+    text = _extract_text_generic(event)
+
+    if text:
+        msg_type = "text"
     else:
-        # Uazapi simples
-        if isinstance(event.get("text"), str):
-            text = event.get("text")
-            msg_type = "text"
-        elif isinstance(event.get("message"), str):
-            text = event.get("message")
-            msg_type = "text"
+        # detectar mídia básica
+        if _deep_get(event, "data.data.messages.0.message.imageMessage") or event.get("image"):
+            msg_type = "image"
+        elif _deep_get(event, "data.data.messages.0.message.videoMessage") or event.get("video"):
+            msg_type = "video"
+        elif _deep_get(event, "data.data.messages.0.message.audioMessage") or event.get("audio"):
+            msg_type = "audio"
+        elif _deep_get(event, "data.data.messages.0.message.documentMessage") or event.get("document"):
+            msg_type = "pdf"
         else:
             msg_type = "unknown"
 
@@ -246,7 +271,7 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
         if len(digits) < 10:
             sample = str(event)[:200]
             print(f"[webhook] phone_too_short extracted={phone} sample={sample}")
-            phone = None  # força o ACK sem reply para evitar enviar errado
+            phone = None
 
     return {"phone": phone, "msg_type": msg_type, "text": text}
 
@@ -314,6 +339,7 @@ async def webhook_post(
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
     user = await _get_or_create_user(db, phone=phone, name=push_name)
 
+    # Save incoming message
     in_msg = Message(
         user_id=user.id,
         sender="user",
@@ -325,7 +351,8 @@ async def webhook_post(
     await db.commit()
 
     if msg_type == "text" and text:
-        thread_id = await get_or_create_thread(user, db)
+        # ORDEM CORRETA: (session, user)
+        thread_id = await get_or_create_thread(db, user)
         reply_text = await ask_assistant(thread_id, text) or "Desculpe, não consegui processar sua mensagem agora."
     else:
         reply_text = "Arquivo recebido com sucesso. Já estou processando! ✅"
