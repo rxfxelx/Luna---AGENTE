@@ -4,13 +4,13 @@ Integração com Uazapi (WhatsApp) e upload opcional para Baserow.
 Expõe:
 - send_whatsapp_message(phone, content, type_="text", media_url=None, mime_type=None, caption=None)
 - send_message(...) -> alias compatível (usa send_whatsapp_message)
-- send_menu(phone, text, choices, footer) -> ENV seleciona o endpoint (padrão: /send/menu)
+- send_menu(phone, text, choices, footer) -> novo, envia botões (menu interativo)
 - upload_file_to_baserow(media_url) -> Optional[dict]
 
-Observações:
-- Para '/send/text', prioriza payload {'number': '<digits>', 'text': '...'} (evita 400 Missing required fields).
-- Para '/send/media', prioriza {'number': '<digits>', 'url': '...','caption': '...'}.
-- Headers flexíveis: 'token' (padrão), 'apikey' ou 'Authorization: Bearer'.
+Ajustes nesta versão:
+- Para o endpoint '/send/text', prioriza payload {'number': '<digits>', 'text': '...'}.
+- Para o endpoint '/send/media', prioriza payload {'number': '<digits>', 'url': '...','caption': '...'}.
+- Adicionado suporte a '/send/menu' para botões.
 """
 
 from __future__ import annotations
@@ -27,11 +27,12 @@ UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN", "")
 # 'token' | 'apikey' | 'authorization_bearer'
 UAZAPI_AUTH_HEADER_NAME = os.getenv("UAZAPI_AUTH_HEADER_NAME", "token").lower()
 
+# Rotas vindas do ambiente
 UAZAPI_SEND_TEXT_PATH = os.getenv("UAZAPI_SEND_TEXT_PATH", "/send/text")
 UAZAPI_SEND_MEDIA_PATH = os.getenv("UAZAPI_SEND_MEDIA_PATH", "/send/media")
 UAZAPI_SEND_MENU_PATH = os.getenv("UAZAPI_SEND_MENU_PATH", "/send/menu")
 
-# Fallbacks comuns observados em instalações diferentes
+# Fallbacks comuns
 _TEXT_FALLBACKS = ["/send/message", "/api/sendText", "/sendText", "/messages/send", "/message/send"]
 _MEDIA_FALLBACKS = ["/send/file", "/api/sendFile", "/api/sendMedia"]
 
@@ -55,7 +56,6 @@ def _dedup(seq: Iterable[str]) -> list[str]:
     return out
 
 def _headers() -> Dict[str, str]:
-    """Monta headers aceitando diferentes esquemas de autenticação."""
     if not UAZAPI_TOKEN:
         raise RuntimeError("UAZAPI_TOKEN não configurado.")
     base = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -66,7 +66,6 @@ def _headers() -> Dict[str, str]:
     elif UAZAPI_AUTH_HEADER_NAME in {"authorization_bearer", "authorization", "bearer"}:
         base["Authorization"] = f"Bearer {UAZAPI_TOKEN}"
     else:
-        # Fallback seguro
         base["token"] = UAZAPI_TOKEN
     return base
 
@@ -75,21 +74,11 @@ def _chatid_variants(phone: str):
     for v in (f"{digits}@c.us", f"{digits}@s.whatsapp.net", digits):
         yield v
 
-# -------------------- Envio de mensagens --------------------
-async def send_whatsapp_message(
-    phone: str,
-    content: str,
-    *,
-    type_: str = "text",
-    media_url: Optional[str] = None,
-    mime_type: Optional[str] = None,
-    caption: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Envia mensagem via Uazapi com múltiplas tentativas (endpoints/payloads).
-    - Texto: sempre tenta '/send/text' primeiro com {"number": "...", "text": "..."}.
-    - Mídia: tenta '/send/media' (number/url/caption) e fallbacks compatíveis.
-    """
+# -------------------- Senders --------------------
+async def send_whatsapp_message(phone: str, content: str, *, type_: str = "text",
+                                media_url: Optional[str] = None,
+                                mime_type: Optional[str] = None,
+                                caption: Optional[str] = None) -> Dict[str, Any]:
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
 
@@ -97,88 +86,69 @@ async def send_whatsapp_message(
     digits = _only_digits(phone) or phone
 
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
-        # --- TEXTO ---
         if type_ == "text" or not media_url:
             for endpoint in _dedup(["/send/text", UAZAPI_SEND_TEXT_PATH] + _TEXT_FALLBACKS):
                 candidates = [
-                    {"number": digits, "text": content},                         # preferido
-                    {"phone": digits, "text": content},                          # variação
+                    {"number": digits, "text": content},
+                    {"phone": digits, "text": content},
+                    {"chatId": f"{digits}@c.us", "text": content},
                 ]
-                # manter compatibilidade com chatId em instalações antigas
-                candidates.extend({"chatId": cid, "text": content} for cid in _chatid_variants(digits))
-
                 for payload in candidates:
                     try:
                         resp = await client.post(endpoint, json=payload, headers=headers)
                         if resp.status_code < 400:
-                            return resp.json() if resp.content else {"status": "ok"}
-                        else:
-                            print(f"[uazapi] {endpoint} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                            return resp.json() if resp.content else {}
                     except Exception as exc:
-                        print(f"[uazapi] exception {endpoint} payload={list(payload.keys())}: {exc}")
-            raise RuntimeError(f"Uazapi text send failed for phone={phone}")
+                        print(f"[uazapi] exception {endpoint} {exc}")
+            raise RuntimeError(f"Falha ao enviar texto para {phone}")
 
-        # --- MÍDIA ---
         else:
+            mime = mime_type or "application/octet-stream"
             for endpoint in _dedup([UAZAPI_SEND_MEDIA_PATH, "/send/media"] + _MEDIA_FALLBACKS):
                 candidates = [
-                    {"number": digits, "url": media_url, "caption": caption or content},  # preferido
-                    {"phone": digits, "url": media_url, "caption": caption or content},   # variação
+                    {"number": digits, "url": media_url, "caption": caption or content},
+                    {"phone": digits, "url": media_url, "caption": caption or content},
+                    {"chatId": f"{digits}@c.us", "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
                 ]
-                # fallback 'fileUrl' + 'mimeType' para variantes Baileys
-                candidates.extend({
-                    "chatId": cid,
-                    "fileUrl": media_url,
-                    "mimeType": mime_type or "application/octet-stream",
-                    "caption": caption or content,
-                } for cid in _chatid_variants(digits))
-
                 for payload in candidates:
                     try:
                         resp = await client.post(endpoint, json=payload, headers=headers)
                         if resp.status_code < 400:
-                            return resp.json() if resp.content else {"status": "ok"}
-                        else:
-                            print(f"[uazapi] {endpoint} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                            return resp.json() if resp.content else {}
                     except Exception as exc:
-                        print(f"[uazapi] exception {endpoint} payload={list(payload.keys())}: {exc}")
-            raise RuntimeError(f"Uazapi media send failed for phone={phone}")
+                        print(f"[uazapi] exception {endpoint} {exc}")
+            raise RuntimeError(f"Falha ao enviar mídia para {phone}")
 
 async def send_menu(phone: str, *, text: str, choices: list[str], footer: str) -> Dict[str, Any]:
     """
     Envia menu (botões) interativo via Uazapi.
-    Documentação: https://docs.uazapi.com/endpoint/post/send~menu
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
-    endpoint = _ensure_leading_slash(UAZAPI_SEND_MENU_PATH or "/send/menu")
+    digits = _only_digits(phone) or phone
+    headers = _headers()
     payload = {
-        "number": _only_digits(phone) or phone,
+        "number": digits,
         "type": "button",
         "text": text,
         "choices": choices,
         "footerText": footer,
     }
+    endpoint = _ensure_leading_slash(UAZAPI_SEND_MENU_PATH or "/send/menu")
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
-        resp = await client.post(endpoint, json=payload, headers=_headers())
+        resp = await client.post(endpoint, json=payload, headers=headers)
         resp.raise_for_status()
-        return resp.json() if resp.content else {"status": "ok"}
+        return resp.json() if resp.content else {}
 
-# Alias de retrocompatibilidade
-async def send_message(
-    *,
-    phone: str,
-    text: str,
-    media_url: Optional[str] = None,
-    mime_type: Optional[str] = None,
-) -> Dict[str, Any]:
+# -------------------- Compat --------------------
+async def send_message(*, phone: str, text: str,
+                       media_url: Optional[str] = None,
+                       mime_type: Optional[str] = None) -> Dict[str, Any]:
     if media_url:
-        return await send_whatsapp_message(
-            phone=phone, content=text, type_="media", media_url=media_url, mime_type=mime_type, caption=text
-        )
+        return await send_whatsapp_message(phone=phone, content=text, type_="media", media_url=media_url, mime_type=mime_type)
     return await send_whatsapp_message(phone=phone, content=text, type_="text")
 
-# -------------------- Baserow (opcional) --------------------
+# -------------------- Baserow --------------------
 BASEROW_BASE_URL = os.getenv("BASEROW_BASE_URL", "").rstrip("/")
 BASEROW_API_TOKEN = os.getenv("BASEROW_API_TOKEN", "")
 
