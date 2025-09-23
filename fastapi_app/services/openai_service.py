@@ -19,9 +19,8 @@ from ..models.db_models import User
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID", "")
-# Modelo para fallback (opcional). Se não informar, usaremos 'gpt-4o-mini'.
+# Fallback de modelo se não houver assistant válido
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "") or "gpt-4o-mini"
-# System prompt para fallback via Chat Completions
 OPENAI_FALLBACK_SYSTEM = os.getenv(
     "OPENAI_FALLBACK_SYSTEM",
     "Você é a Luna, uma assistente útil e direta. Responda em português do Brasil.",
@@ -52,6 +51,7 @@ def _headers_chat() -> dict:
 
 
 async def get_or_create_thread(session: AsyncSession, user: User) -> str:
+    """Retorna o thread_id do usuário; cria no OpenAI se não existir."""
     if user.thread_id:
         return user.thread_id
 
@@ -62,8 +62,7 @@ async def get_or_create_thread(session: AsyncSession, user: User) -> str:
         except httpx.HTTPStatusError as e:
             print(f"[openai] criar thread: status={e.response.status_code} body={e.response.text}")
             raise
-        data = resp.json()
-        thread_id = data.get("id")
+        thread_id = resp.json().get("id")
         if not thread_id:
             raise RuntimeError("OpenAI não retornou 'id' do thread.")
 
@@ -75,7 +74,7 @@ async def get_or_create_thread(session: AsyncSession, user: User) -> str:
 
 
 async def _chat_fallback(user_message: str) -> Optional[str]:
-    """Fallback final via Chat Completions (garante resposta mesmo sem Assistants)."""
+    """Último fallback via Chat Completions (garante resposta sem Assistants)."""
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(
@@ -94,9 +93,7 @@ async def _chat_fallback(user_message: str) -> Optional[str]:
             data = r.json()
             choice = (data.get("choices") or [{}])[0]
             msg = (choice.get("message") or {}).get("content")
-            if isinstance(msg, str) and msg.strip():
-                return msg.strip()
-            return None
+            return msg.strip() if isinstance(msg, str) and msg.strip() else None
     except httpx.HTTPStatusError as e:
         print(f"[openai] chat fallback status={e.response.status_code} body={e.response.text}")
         return None
@@ -106,9 +103,9 @@ async def _chat_fallback(user_message: str) -> Optional[str]:
 
 
 async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
-    """Tenta Assistants v2; se falhar, cai para modelo (run com 'model') e, por fim, Chat Completions."""
+    """Assistants v2 com fallbacks: run por assistant_id → run por model → chat completions."""
     async with httpx.AsyncClient(timeout=60.0) as client:
-        # 1) Adiciona a mensagem do usuário na thread (formato v2)
+        # 1) Posta a mensagem do usuário
         try:
             r = await client.post(
                 f"{_BASE_URL}/threads/{thread_id}/messages",
@@ -116,49 +113,41 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
                 json={"role": "user", "content": [{"type": "text", "text": user_message}]},
             )
             if r.status_code >= 400:
-                # fallback para conteúdo simples (algumas contas aceitam só string)
+                # fallback para conteúdo simples (algumas contas ainda aceitam string)
                 r2 = await client.post(
                     f"{_BASE_URL}/threads/{thread_id}/messages",
                     headers=_headers_assistants(),
                     json={"role": "user", "content": user_message},
                 )
-                try:
-                    r2.raise_for_status()
-                except httpx.HTTPStatusError as e:
-                    print(f"[openai] postar mensagem: status={e.response.status_code} body={e.response.text}")
-                    # não retorna ainda; vamos tentar fallback por modelo logo abaixo
+                r2.raise_for_status()
         except Exception as exc:
             print(f"[openai] erro ao postar mensagem do usuário: {exc}")
 
-        # 2) Cria o run com assistant_id; se 400/404/etc, tenta run com 'model'
+        # 2) Cria run
         run_id: Optional[str] = None
         try:
-            run_resp = await client.post(
+            run = await client.post(
                 f"{_BASE_URL}/threads/{thread_id}/runs",
                 headers=_headers_assistants(),
                 json={"assistant_id": ASSISTANT_ID},
             )
-            if run_resp.status_code >= 400:
-                print(f"[openai] run assistant_id falhou: status={run_resp.status_code} body={run_resp.text}")
-                # Fallback: run com 'model'
-                run_resp = await client.post(
+            if run.status_code >= 400:
+                print(f"[openai] run assistant_id falhou: status={run.status_code} body={run.text}")
+                run = await client.post(
                     f"{_BASE_URL}/threads/{thread_id}/runs",
                     headers=_headers_assistants(),
                     json={"model": OPENAI_MODEL},
                 )
-            run_resp.raise_for_status()
-            run_id = run_resp.json().get("id")
-        except httpx.HTTPStatusError as e:
-            print(f"[openai] erro ao criar run: status={e.response.status_code} body={e.response.text}")
+            run.raise_for_status()
+            run_id = run.json().get("id")
         except Exception as exc:
             print(f"[openai] erro ao criar run: {exc}")
 
-        # 3) Se ainda não temos run, cai direto para Chat Completions
+        # 3) Se não criou run, cai p/ Chat Completions
         if not run_id:
-            print("[openai] sem run_id — usando fallback Chat Completions.")
             return await _chat_fallback(user_message)
 
-        # 4) Polling até completar
+        # 4) Polling
         for _ in range(60):
             try:
                 st = await client.get(
@@ -171,24 +160,20 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
                 if status == "completed":
                     break
                 if status in {"failed", "expired", "cancelled"}:
-                    print(f"[openai] run terminou com status={status} details={jd}")
+                    print(f"[openai] run terminou com status={status}")
                     return await _chat_fallback(user_message)
-                # Se requer ação (tools), como não temos ferramentas, melhor cair pro fallback
                 if status == "requires_action":
-                    print(f"[openai] run requires_action; usando fallback.")
+                    print("[openai] run requires_action; usando fallback.")
                     return await _chat_fallback(user_message)
-            except httpx.HTTPStatusError as e:
-                print(f"[openai] polling run: status={e.response.status_code} body={e.response.text}")
-                return await _chat_fallback(user_message)
             except Exception as exc:
-                print(f"[openai] erro no polling do run: {exc}")
+                print(f"[openai] polling run: {exc}")
                 return await _chat_fallback(user_message)
             await asyncio.sleep(1.0)
         else:
-            print("[openai] run não concluiu no tempo; usando fallback.")
+            print("[openai] run não concluiu no tempo; fallback.")
             return await _chat_fallback(user_message)
 
-        # 5) Busca mensagens e extrai texto
+        # 5) Lê mensagens e extrai texto
         try:
             msgs = await client.get(
                 f"{_BASE_URL}/threads/{thread_id}/messages",
@@ -197,9 +182,6 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
             )
             msgs.raise_for_status()
             data = msgs.json().get("data", [])
-        except httpx.HTTPStatusError as e:
-            print(f"[openai] listar mensagens: status={e.response.status_code} body={e.response.text}")
-            return await _chat_fallback(user_message)
         except Exception as exc:
             print(f"[openai] erro ao buscar mensagens: {exc}")
             return await _chat_fallback(user_message)
@@ -216,5 +198,5 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
                 elif isinstance(contents, str):
                     return contents
 
-        # Nada encontrado -> fallback
+        # Sem texto → fallback final
         return await _chat_fallback(user_message)
