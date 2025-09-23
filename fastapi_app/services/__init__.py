@@ -1,7 +1,5 @@
 """
 Service layer exports.
-
-Este módulo reexporta funções para uso em outros módulos.
 """
 
 from .uazapi_service import (
@@ -20,3 +18,4 @@ __all__ = [
     "get_or_create_thread",
     "ask_assistant",
 ]
+
