@@ -1,348 +1,269 @@
-# fastapi_app/services/openai_service.py
+# fastapi_app/services/uazapi_service.py
 """
-Integração com OpenAI Assistants API v2 — execução completa de tools.
+Integração com Uazapi (WhatsApp) e upload opcional para Baserow.
 
-Fluxo por mensagem:
-  1) POST /threads/{id}/messages (role=user)
-  2) POST /threads/{id}/runs (assistant_id)
-  3) Poll até status final:
-     - requires_action -> executar tools (Uazapi) -> submit_tool_outputs -> continuar polling
-     - completed       -> listar mensagens (order=desc) e extrair resposta do assistant
-     - failed/expired  -> fallback opcional a Chat Completions (último recurso)
+Expõe (compat + helpers):
+- send_whatsapp_message(phone, content, type_="text", media_url=None, mime_type=None, caption=None)
+- send_menu_interesse(phone, text, yes_label, no_label, footer_text=None)
+- send_message(...) -> alias compatível (usa send_whatsapp_message)
 
-As INSTRUÇÕES ficam somente no objeto Assistant (ASSISTANT_ID).
+NOVO (helpers exportados p/ Assistants tools):
+- normalize_number(phone) -> str
+- send_whatsapp_text(phone, text)
+- send_whatsapp_media(phone, media_type, media_url, caption=None)
+- send_whatsapp_menu(phone, text, choices, footer_text=None)
+
+Mantém fallbacks de endpoint/JSON para múltiplas instalações Uazapi.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import os
-import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, Optional, List
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
 
-# Dependências locais
-from .uazapi_service import (
-    normalize_number,
-    send_whatsapp_message,
-    send_menu_interesse,
-)
+# -------------------- Config --------------------
+UAZAPI_BASE_URL = os.getenv("UAZAPI_BASE_URL", "").rstrip("/")
+UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN", "")
+UAZAPI_AUTH_HEADER_NAME = os.getenv("UAZAPI_AUTH_HEADER_NAME", "token").lower()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ASSISTANT_ID = os.getenv("ASSISTANT_ID", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "") or "gpt-4o-mini"
+UAZAPI_SEND_TEXT_PATH = os.getenv("UAZAPI_SEND_TEXT_PATH", "/send/text")
+UAZAPI_SEND_MEDIA_PATH = os.getenv("UAZAPI_SEND_MEDIA_PATH", "/send/media")
+UAZAPI_SEND_MENU_PATH = os.getenv("UAZAPI_SEND_MENU_PATH", "/send/menu")
 
-# Conteúdos (menu/vídeo) vindos do ambiente
-LUNA_MENU_YES = (os.getenv("LUNA_MENU_YES", "Sim, pode continuar") or "").strip()
-LUNA_MENU_NO = (os.getenv("LUNA_MENU_NO", "Não, encerrar contato") or "").strip()
-LUNA_MENU_TEXT = (os.getenv("LUNA_MENU_TEXT", "") or "").strip()
-LUNA_MENU_FOOTER = (os.getenv("LUNA_MENU_FOOTER", "") or "").strip()
+_TEXT_FALLBACKS = ["/send/text", "/send/message", "/api/sendText", "/sendText", "/messages/send", "/message/send"]
+_MEDIA_FALLBACKS = ["/send/media", "/send/file", "/api/sendFile", "/api/sendMedia"]
 
-LUNA_VIDEO_URL = (os.getenv("LUNA_VIDEO_URL", "") or "").strip()
-LUNA_VIDEO_CAPTION = (os.getenv("LUNA_VIDEO_CAPTION", "") or "").strip()
-LUNA_VIDEO_AFTER_TEXT = (os.getenv("LUNA_VIDEO_AFTER_TEXT", "") or "").strip()
-LUNA_END_TEXT = (os.getenv("LUNA_END_TEXT", "") or "").strip()
+# -------------------- Helpers --------------------
+def _ensure_leading_slash(path: str) -> str:
+    return path if path.startswith("/") else f"/{path}"
 
-FALLBACK_SYSTEM_PTBR = (
-    "Você é a Luna, uma assistente direta e profissional. "
-    "Responda em português do Brasil de forma objetiva."
-)
+def _only_digits(s: str) -> str:
+    return "".join(ch for ch in str(s) if ch.isdigit())
 
-RUN_POLL_MAX = int(os.getenv("OPENAI_RUN_POLL_MAX", "120"))
-RUN_POLL_INTERVAL = float(os.getenv("OPENAI_RUN_POLL_INTERVAL", "1.0"))
+def normalize_number(phone: str) -> str:
+    """Exportado: normaliza número, mantendo apenas dígitos."""
+    return _only_digits(phone) or phone
 
-_BASE_URL = "https://api.openai.com/v1"
-
-
-# -------------------- HTTP helpers --------------------
-def _headers_assistants() -> Dict[str, str]:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY não configurado.")
-    if not ASSISTANT_ID:
-        raise RuntimeError("ASSISTANT_ID não configurado.")
-    return {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-        "OpenAI-Beta": "assistants=v2",
-    }
-
-
-def _headers_chat() -> Dict[str, str]:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY não configurado.")
-    return {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
-# -------------------- Threads --------------------
-async def get_or_create_thread(session: AsyncSession, user) -> str:
-    """Cria uma thread para o usuário ou retorna a existente."""
-    th = getattr(user, "thread_id", None)
-    if th:
-        return th
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(f"{_BASE_URL}/threads", headers=_headers_assistants(), json={})
-        r.raise_for_status()
-        thread_id = r.json()["id"]
-    setattr(user, "thread_id", thread_id)
-    session.add(user)
-    await session.commit()
-    await session.refresh(user)
-    return thread_id
-
-
-# -------------------- Fallback (último recurso) --------------------
-async def _chat_fallback(user_message: str) -> Optional[str]:
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                f"{_BASE_URL}/chat/completions",
-                headers=_headers_chat(),
-                json={
-                    "model": OPENAI_MODEL,
-                    "messages": [
-                        {"role": "system", "content": FALLBACK_SYSTEM_PTBR},
-                        {"role": "user", "content": user_message},
-                    ],
-                    "temperature": 0.6,
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-            msg = (data.get("choices") or [{}])[0].get("message", {}).get("content")
-            if isinstance(msg, str) and msg.strip():
-                return msg.strip()
-    except Exception as exc:
-        print(f"[openai] chat fallback erro: {exc}")
-    return None
-
-
-# -------------------- Poll / status --------------------
-def _extract_run_id_from_error(text: str) -> Optional[str]:
-    m = re.search(r"(run_[A-Za-z0-9]+)", text or "")
-    return m.group(1) if m else None
-
-
-async def _poll_run(client: httpx.AsyncClient, thread_id: str, run_id: str) -> Dict[str, Any]:
-    for _ in range(RUN_POLL_MAX):
-        st = await client.get(f"{_BASE_URL}/threads/{thread_id}/runs/{run_id}", headers=_headers_assistants())
-        st.raise_for_status()
-        data = st.json()
-        status = data.get("status")
-        if status in {"completed", "failed", "expired", "cancelled", "requires_action"}:
-            return data
-        await asyncio.sleep(RUN_POLL_INTERVAL)
-    return {"status": "timeout"}
-
-
-# -------------------- Tools mapping --------------------
-async def _tool_enviar_caixinha_interesse(number: str, args: Dict[str, Any]) -> str:
-    number = normalize_number(number or "")
-    if not LUNA_MENU_TEXT:
-        return json.dumps({"ok": False, "reason": "no_menu_text"})
-    await send_menu_interesse(
-        phone=number,
-        text=LUNA_MENU_TEXT,
-        yes_label=LUNA_MENU_YES or "Sim",
-        no_label=LUNA_MENU_NO or "Não",
-        footer_text=LUNA_MENU_FOOTER or None,
-    )
-    return json.dumps({"ok": True, "sent": "menu"})
-
-
-async def _tool_enviar_video(number: str, args: Dict[str, Any]) -> str:
-    number = normalize_number(number or "")
-    url = args.get("url") or LUNA_VIDEO_URL
-    caption = args.get("caption") or LUNA_VIDEO_CAPTION
-    if not url:
-        return json.dumps({"ok": False, "reason": "no_video_url"})
-    await send_whatsapp_message(
-        phone=number,
-        content=caption or "",
-        type_="media",
-        media_url=url,
-        caption=caption or "",
-    )
-    if LUNA_VIDEO_AFTER_TEXT:
-        await send_whatsapp_message(phone=number, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
-    return json.dumps({"ok": True, "sent": "video"})
-
-
-async def _tool_enviar_msg(number: str, args: Dict[str, Any]) -> str:
-    number = normalize_number(number or "")
-    lead_nome = (args or {}).get("lead_nome") or ""
-    # lead_area pode ser usado em futuras integrações (CRM etc.)
-    _lead_area = (args or {}).get("lead_area") or ""
-    text = f"Perfeito, {lead_nome}. Vou te colocar em contato com um consultor criativo da Verbo Vídeo."
-    await send_whatsapp_message(phone=number, content=text.strip(), type_="text")
-    if LUNA_END_TEXT:
-        await send_whatsapp_message(phone=number, content=LUNA_END_TEXT, type_="text")
-    return json.dumps({"ok": True, "lead_nome": lead_nome})
-
-
-async def _tool_numero_novo(number: str, args: Dict[str, Any]) -> str:
-    # Aqui você pode registrar no DB/CRM; por enquanto apenas confirma.
-    return json.dumps({"ok": True, "novo_contato": args})
-
-
-async def _tool_excluir_dados_lead(number: str, args: Dict[str, Any]) -> str:
-    number = normalize_number(number or "")
-    await send_whatsapp_message(phone=number, content="Ok, seus dados foram excluídos (LGPD).", type_="text")
-    return json.dumps({"ok": True, "deleted": True})
-
-
-_TOOL_MAP = {
-    "enviar_caixinha_interesse": _tool_enviar_caixinha_interesse,
-    "enviar_video": _tool_enviar_video,
-    "enviar_msg": _tool_enviar_msg,
-    "numero_novo": _tool_numero_novo,
-    "excluir_dados_lead": _tool_excluir_dados_lead,
-}
-
-
-async def _handle_requires_action(
-    client: httpx.AsyncClient,
-    thread_id: str,
-    run_id: str,
-    requires_action: Dict[str, Any],
-    number: Optional[str],
-    lead_name: Optional[str],
-) -> None:
-    submit = (requires_action or {}).get("submit_tool_outputs") or {}
-    tool_calls: List[Dict[str, Any]] = submit.get("tool_calls") or []
-    outputs: List[Dict[str, str]] = []
-    for tc in tool_calls:
-        t_id = tc.get("id")
-        fn = (tc.get("function") or {})
-        name = fn.get("name")
-        raw_args = fn.get("arguments") or "{}"
-        try:
-            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-        except Exception:
-            args = {}
-
-        # injeta nome/número quando fizer sentido
-        if name == "enviar_msg":
-            args.setdefault("lead_nome", (lead_name or "").strip())
-
-        handler = _TOOL_MAP.get(name)
-        if not handler:
-            outputs.append({"tool_call_id": t_id, "output": json.dumps({"ok": False, "unknown_tool": name})})
+def _dedup(seq: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for x in seq:
+        if not x:
             continue
+        x = _ensure_leading_slash(x)
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
-        try:
-            out = await handler(number or "", args)
-        except Exception as exc:
-            out = json.dumps({"ok": False, "error": str(exc)})
+def _headers() -> Dict[str, str]:
+    if not UAZAPI_TOKEN:
+        raise RuntimeError("UAZAPI_TOKEN não configurado.")
+    base = {"Accept": "application/json", "Content-Type": "application/json"}
+    if UAZAPI_AUTH_HEADER_NAME in {"token", "x-token"}:
+        base["token"] = UAZAPI_TOKEN
+    elif UAZAPI_AUTH_HEADER_NAME in {"apikey", "api-key", "api_key"}:
+        base["apikey"] = UAZAPI_TOKEN
+    elif UAZAPI_AUTH_HEADER_NAME in {"authorization_bearer", "authorization", "bearer"}:
+        base["Authorization"] = f"Bearer {UAZAPI_TOKEN}"
+    else:
+        base["token"] = UAZAPI_TOKEN
+    return base
 
-        outputs.append({"tool_call_id": t_id, "output": out})
+def _chatid_variants(phone: str) -> Iterable[str]:
+    digits = _only_digits(phone) or phone
+    seen = set()
+    for v in (f"{digits}@c.us", f"{digits}@s.whatsapp.net", digits):
+        if v and v not in seen:
+            seen.add(v)
+            yield v
 
-    r = await client.post(
-        f"{_BASE_URL}/threads/{thread_id}/runs/{run_id}/submit_tool_outputs",
-        headers=_headers_assistants(),
-        json={"tool_outputs": outputs},
-    )
-    r.raise_for_status()
+def _infer_mime_from_url(url: str) -> str:
+    l = (url or "").lower()
+    if l.endswith(".jpg") or l.endswith(".jpeg"):
+        return "image/jpeg"
+    if l.endswith(".png"):
+        return "image/png"
+    if l.endswith(".gif"):
+        return "image/gif"
+    if l.endswith(".mp4"):
+        return "video/mp4"
+    if l.endswith(".pdf"):
+        return "application/pdf"
+    if l.endswith(".mp3"):
+        return "audio/mpeg"
+    if l.endswith(".ogg") or l.endswith(".opus"):
+        return "audio/ogg"
+    return "application/octet-stream"
 
+def _text_endpoints() -> List[str]:
+    candidates = ["/send/text", UAZAPI_SEND_TEXT_PATH] + _TEXT_FALLBACKS
+    return _dedup(candidates)
 
-# -------------------- API principal --------------------
-async def ask_assistant(
-    thread_id: str,
-    user_message: str,
+def _media_endpoints() -> List[str]:
+    candidates = [UAZAPI_SEND_MEDIA_PATH, "/send/media"] + _MEDIA_FALLBACKS
+    return _dedup(candidates)
+
+# -------------------- Senders principais --------------------
+async def send_whatsapp_message(
+    phone: str,
+    content: str,
     *,
-    number: Optional[str] = None,
-    lead_name: Optional[str] = None,
-) -> Optional[str]:
-    """
-    Envia a mensagem do usuário ao Assistant, executa tools quando requerido
-    e retorna o texto final do assistant (quando houver).
-    """
+    type_: str = "text",
+    media_url: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    caption: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not UAZAPI_BASE_URL:
+        raise RuntimeError("UAZAPI_BASE_URL não configurada.")
+
+    headers = _headers()
+    digits = normalize_number(phone)
+
+    async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
+        if type_ == "text" or not media_url:
+            for endpoint in _text_endpoints():
+                if endpoint == "/send/text":
+                    candidates = [
+                        {"number": digits, "text": content},
+                        {"phone": digits, "text": content},
+                        {"chatId": f"{digits}@c.us", "text": content},
+                    ]
+                else:
+                    candidates = []
+                    for cid in _chatid_variants(digits):
+                        candidates.append({"chatId": cid, "text": content})
+                    candidates.append({"phone": digits, "text": content})
+                    candidates.append({"number": digits, "text": content})
+
+                for payload in candidates:
+                    try:
+                        resp = await client.post(endpoint, json=payload, headers=headers)
+                        if resp.status_code < 400:
+                            try:
+                                return resp.json()
+                            except Exception:
+                                return {"status": "ok", "http_status": resp.status_code}
+                        else:
+                            print(f"[uazapi] {endpoint} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                    except Exception as exc:
+                        print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
+            raise RuntimeError(f"Uazapi text send failed for phone={phone}")
+        else:
+            mime = mime_type or _infer_mime_from_url(media_url)
+            for endpoint in _media_endpoints():
+                if endpoint == "/send/media":
+                    candidates = [
+                        {"number": digits, "url": media_url, "caption": caption or content},
+                        {"phone": digits, "url": media_url, "caption": caption or content},
+                        {"chatId": f"{digits}@c.us", "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
+                    ]
+                else:
+                    candidates = [
+                        {"chatId": f"{digits}@c.us", "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
+                        {"phone": digits, "url": media_url, "caption": caption or content},
+                        {"number": digits, "url": media_url, "caption": caption or content},
+                    ]
+                for payload in candidates:
+                    try:
+                        resp = await client.post(endpoint, json=payload, headers=headers)
+                        if resp.status_code < 400:
+                            try:
+                                return resp.json()
+                            except Exception:
+                                return {"status": "ok", "http_status": resp.status_code}
+                        else:
+                            print(f"[uazapi] {endpoint} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                    except Exception as exc:
+                        print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
+            raise RuntimeError(f"Uazapi media send failed for phone={phone}")
+
+async def send_menu_interesse(
+    *,
+    phone: str,
+    text: str,
+    yes_label: str,
+    no_label: str,
+    footer_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not UAZAPI_BASE_URL:
+        raise RuntimeError("UAZAPI_BASE_URL não configurada.")
+    headers = _headers()
+    digits = normalize_number(phone)
+
+    payloads = [
+        {"number": digits, "type": "button", "text": text, "choices": [yes_label, no_label], **({"footerText": footer_text} if footer_text else {})},
+        {"phone": digits, "type": "button", "text": text, "choices": [yes_label, no_label], **({"footerText": footer_text} if footer_text else {})},
+    ]
+    endpoint = _ensure_leading_slash(UAZAPI_SEND_MENU_PATH or "/send/menu")
+    async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
+        for payload in payloads:
+            try:
+                resp = await client.post(endpoint, json=payload, headers=headers)
+                if resp.status_code < 400:
+                    try:
+                        return resp.json()
+                    except Exception:
+                        return {"status": "ok", "http_status": resp.status_code}
+                print(f"[uazapi] {endpoint} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+            except Exception as exc:
+                print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
+    raise RuntimeError("Uazapi menu send failed")
+
+# Alias de retrocompatibilidade
+async def send_message(
+    *,
+    phone: str,
+    text: str,
+    media_url: Optional[str] = None,
+    mime_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    if media_url:
+        return await send_whatsapp_message(phone=phone, content=text, type_="media", media_url=media_url, mime_type=mime_type, caption=text)
+    return await send_whatsapp_message(phone=phone, content=text, type_="text")
+
+# -------------------- Helpers exportados para openai_service --------------------
+async def send_whatsapp_text(phone: str, text: str) -> Dict[str, Any]:
+    return await send_whatsapp_message(phone=phone, content=text, type_="text")
+
+async def send_whatsapp_media(phone: str, media_type: str, media_url: str, caption: Optional[str] = None) -> Dict[str, Any]:
+    # media_type é mantido por compatibilidade; Uazapi aceita 'url'+'caption'
+    return await send_whatsapp_message(phone=phone, content=caption or "", type_="media", media_url=media_url, caption=caption)
+
+async def send_whatsapp_menu(phone: str, text: str, choices: List[str], footer_text: Optional[str] = None) -> Dict[str, Any]:
+    yes = choices[0] if choices else "Sim"
+    no = choices[1] if len(choices) > 1 else "Não"
+    return await send_menu_interesse(phone=phone, text=text, yes_label=yes, no_label=no, footer_text=footer_text)
+
+# -------------------- Baserow (opcional) --------------------
+BASEROW_BASE_URL = os.getenv("BASEROW_BASE_URL", "").rstrip("/")
+BASEROW_API_TOKEN = os.getenv("BASEROW_API_TOKEN", "")
+
+async def upload_file_to_baserow(media_url: str) -> Optional[dict]:
+    if not BASEROW_BASE_URL or not BASEROW_API_TOKEN:
+        print("Baserow não configurado – pulando upload de arquivo.")
+        return None
     async with httpx.AsyncClient(timeout=60.0) as client:
-        # 1) Posta a mensagem do usuário (resiliente a run ativa)
-        for _ in range(2):
-            mr = await client.post(
-                f"{_BASE_URL}/threads/{thread_id}/messages",
-                headers=_headers_assistants(),
-                json={"role": "user", "content": [{"type": "text", "text": user_message}]},
-            )
-            if mr.status_code == 400 and "active run" in mr.text.lower():
-                active_id = _extract_run_id_from_error(mr.text)
-                if not active_id:
-                    break
-                run_data = await _poll_run(client, thread_id, active_id)
-                if run_data.get("status") in {"completed", "failed", "expired", "cancelled"}:
-                    continue
-                await asyncio.sleep(RUN_POLL_INTERVAL)
-                continue
-            mr.raise_for_status()
-            break
-
-        # 2) Cria a run
-        run_resp = await client.post(
-            f"{_BASE_URL}/threads/{thread_id}/runs",
-            headers=_headers_assistants(),
-            json={"assistant_id": ASSISTANT_ID},
-        )
-        run_resp.raise_for_status()
-        run_id = run_resp.json().get("id")
-        if not run_id:
-            return await _chat_fallback(user_message)
-
-        # 3) Poll com suporte a requires_action
-        loops = 0
-        while True:
-            loops += 1
-            if loops > RUN_POLL_MAX:
-                return await _chat_fallback(user_message)
-
-            data = await _poll_run(client, thread_id, run_id)
-            status = data.get("status")
-
-            if status == "completed":
-                break
-
-            if status == "requires_action":
+        try:
+            file_resp = await client.get(media_url)
+            file_resp.raise_for_status()
+            file_bytes = file_resp.content
+            filename = media_url.split("/")[-1].split("?")[0] or "file"
+            files = {"file": (filename, file_bytes)}
+            headers = {"Authorization": f"Token {BASEROW_API_TOKEN}"}
+            for url in (
+                f"{BASEROW_BASE_URL}/api/user-files/upload-file/",
+                f"{BASEROW_BASE_URL}/api/userfiles/upload_file/",
+            ):
                 try:
-                    await _handle_requires_action(
-                        client,
-                        thread_id,
-                        run_id,
-                        data.get("required_action") or {},
-                        number=number,
-                        lead_name=lead_name,
-                    )
-                except Exception as exc:
-                    print(f"[openai] erro em requires_action/tools: {exc}")
-                    return await _chat_fallback(user_message)
-                await asyncio.sleep(RUN_POLL_INTERVAL)
-                continue
-
-            if status in {"failed", "expired", "cancelled", "timeout"}:
-                return await _chat_fallback(user_message)
-
-            await asyncio.sleep(RUN_POLL_INTERVAL)
-
-        # 4) Busca as mensagens (mais recentes primeiro)
-        msgs = await client.get(
-            f"{_BASE_URL}/threads/{thread_id}/messages",
-            headers=_headers_assistants(),
-            params={"limit": 20, "order": "desc"},
-        )
-        msgs.raise_for_status()
-
-        for m in msgs.json().get("data", []):
-            if m.get("role") == "assistant":
-                for c in m.get("content", []):
-                    if c.get("type") == "text":
-                        v = (c.get("text") or {}).get("value")
-                        if v:
-                            return v
-                if isinstance(m.get("content"), str):
-                    return m["content"]
-
-        return await _chat_fallback(user_message)
+                    up = await client.post(url, headers=headers, files=files)
+                    if up.status_code < 400:
+                        return up.json()
+                except Exception:
+                    pass
+            return None
+        except Exception as exc:
+            print(f"Erro ao baixar/enviar arquivo p/ Baserow: {exc}")
+            return None
