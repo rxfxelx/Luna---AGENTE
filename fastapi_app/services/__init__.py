@@ -1,7 +1,7 @@
+# fastapi_app/services/__init__.py
 """
 Service layer exports.
 """
-
 from .uazapi_service import (
     send_whatsapp_message,
     send_message,
