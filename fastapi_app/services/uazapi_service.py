@@ -1,3 +1,4 @@
+# fastapi_app/services/uazapi_service.py
 """
 Integração com Uazapi (WhatsApp) e upload opcional para Baserow.
 
@@ -139,16 +140,14 @@ async def send_whatsapp_message(
                 if endpoint == "/send/text":
                     candidates = [
                         {"number": digits, "text": content},                  # formato preferido (v2)
-                        {"phone": digits, "text": content},                   # variação aceita em algumas instalações
+                        {"phone": digits, "text": content},                   # variação
                         {"chatId": f"{digits}@c.us", "text": content},        # fallback
                     ]
                 else:
                     # Para outras rotas, mantemos compatibilidade ampla
                     candidates = []
-                    # chatId variants primeiro
                     for cid in _chatid_variants(digits):
                         candidates.append({"chatId": cid, "text": content})
-                    # phone/number variantes
                     candidates.append({"phone": digits, "text": content})
                     candidates.append({"number": digits, "text": content})
 
@@ -208,7 +207,6 @@ async def send_menu_interesse(
 ) -> Dict[str, Any]:
     """
     Envia caixinha (menu de botões) usando o endpoint /send/menu.
-    Payload compatível com a doc da Uazapi.
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
@@ -223,7 +221,6 @@ async def send_menu_interesse(
             "choices": [yes_label, no_label],
             **({"footerText": footer_text} if footer_text else {}),
         },
-        # fallbacks aceitando outras chaves
         {
             "phone": digits,
             "type": "button",
