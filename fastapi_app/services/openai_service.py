@@ -7,9 +7,12 @@ Expõe:
 - ask_assistant(thread_id: str, user_message: str) -> Optional[str]
 
 Melhorias:
-- Injeta instruções de execução via ASSISTANT_RUN_INSTRUCTIONS em cada run.
 - Evita 400 "active run" aguardando o run atual terminar antes de postar nova mensagem/criar outro run.
 - Fallback robusto para Chat Completions quando Assistants não puder concluir.
+
+Nota: As instruções do assistente são definidas diretamente no objeto Assistant
+no painel da OpenAI. Não utilizamos mais ASSISTANT_RUN_INSTRUCTIONS via
+variável de ambiente.
 """
 
 from __future__ import annotations
@@ -27,10 +30,13 @@ from ..models.db_models import User
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "") or "gpt-4o-mini"
-ASSISTANT_RUN_INSTRUCTIONS = (os.getenv("ASSISTANT_RUN_INSTRUCTIONS", "") or "").strip().strip('"').strip("'")
 
-RUN_POLL_MAX = int(os.getenv("OPENAI_RUN_POLL_MAX", "60"))          # tentativas
-RUN_POLL_INTERVAL = float(os.getenv("OPENAI_RUN_POLL_INTERVAL", "1.0"))  # segundos
+# Não carregamos mais instruções do assistente via env. Caso precise
+# sobrepor temporariamente as instruções, defina esta variável manualmente em código.
+ASSISTANT_RUN_INSTRUCTIONS: Optional[str] = None
+
+RUN_POLL_MAX = int(os.getenv("OPENAI_RUN_POLL_MAX", "60"))          # tentativas de polling
+RUN_POLL_INTERVAL = float(os.getenv("OPENAI_RUN_POLL_INTERVAL", "1.0"))  # segundos entre polls
 
 _BASE_URL = "https://api.openai.com/v1"
 
@@ -57,6 +63,7 @@ def _headers_chat() -> dict:
 
 
 async def get_or_create_thread(session: AsyncSession, user: User) -> str:
+    """Cria um novo thread para o usuário ou retorna o existente."""
     if user.thread_id:
         return user.thread_id
 
@@ -73,6 +80,7 @@ async def get_or_create_thread(session: AsyncSession, user: User) -> str:
 
 
 async def _chat_fallback(user_message: str) -> Optional[str]:
+    """Fallback para Chat Completions caso a API de Assistants falhe."""
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(
@@ -81,7 +89,10 @@ async def _chat_fallback(user_message: str) -> Optional[str]:
                 json={
                     "model": OPENAI_MODEL,
                     "messages": [
-                        {"role": "system", "content": "Você é a Luna, uma assistente útil e direta. Responda em português do Brasil."},
+                        {
+                            "role": "system",
+                            "content": "Você é a Luna, uma assistente útil e direta. Responda em português do Brasil.",
+                        },
                         {"role": "user", "content": user_message},
                     ],
                     "temperature": 0.7,
@@ -98,9 +109,11 @@ async def _chat_fallback(user_message: str) -> Optional[str]:
 
 
 async def _poll_run(client: httpx.AsyncClient, thread_id: str, run_id: str) -> str:
-    """Retorna 'completed', 'failed', 'expired', 'cancelled' ou 'timeout'."""
+    """Aguarda a conclusão do run retornando seu status final."""
     for _ in range(RUN_POLL_MAX):
-        st = await client.get(f"{_BASE_URL}/threads/{thread_id}/runs/{run_id}", headers=_headers_assistants())
+        st = await client.get(
+            f"{_BASE_URL}/threads/{thread_id}/runs/{run_id}", headers=_headers_assistants()
+        )
         st.raise_for_status()
         status = st.json().get("status")
         if status == "completed":
@@ -108,22 +121,23 @@ async def _poll_run(client: httpx.AsyncClient, thread_id: str, run_id: str) -> s
         if status in {"failed", "expired", "cancelled"}:
             return status
         if status == "requires_action":
-            # não tratamos tools; melhor cair para fallback
+            # Se houver tools para rodar, retornamos falha para forçar o fallback
             return "failed"
         await asyncio.sleep(RUN_POLL_INTERVAL)
     return "timeout"
 
 
 def _extract_run_id_from_error(text: str) -> Optional[str]:
-    # pega padrões do tipo run_ABC123 no corpo do erro
+    """Extrai run_id do corpo de erro (padrão run_ABC123)."""
     m = re.search(r"(run_[A-Za-z0-9]+)", text or "")
     return m.group(1) if m else None
 
 
 async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
+    """Envia a mensagem do usuário ao Assistant e retorna a resposta em texto."""
     async with httpx.AsyncClient(timeout=60.0) as client:
-        # 1) Posta a mensagem do usuário; se houver "active run", aguarda o run terminar e tenta de novo
-        for attempt in range(2):  # no máx duas tentativas de postar
+        # 1) Posta a mensagem do usuário; se houver run ativo, espera finalizar
+        for attempt in range(2):
             mr = await client.post(
                 f"{_BASE_URL}/threads/{thread_id}/messages",
                 headers=_headers_assistants(),
@@ -137,18 +151,15 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
                 if status != "completed":
                     print(f"[openai] active run terminou como {status}; usando fallback.")
                     return await _chat_fallback(user_message)
-                # run terminou -> tenta postar de novo
-                continue
+                continue  # tenta postar de novo
             try:
                 mr.raise_for_status()
             except Exception as exc:
                 print(f"[openai] postar mensagem erro: {exc} body={mr.text}")
-            break  # saiu do loop
+            break
 
-        # 2) Cria o run (com instruções opcionais)
+        # 2) Cria o run sem passar instruções adicionais; elas estão no assistente
         payload = {"assistant_id": ASSISTANT_ID}
-        if ASSISTANT_RUN_INSTRUCTIONS:
-            payload["instructions"] = ASSISTANT_RUN_INSTRUCTIONS
 
         for attempt in range(2):
             run_resp = await client.post(
@@ -164,14 +175,11 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
                 if status != "completed":
                     print(f"[openai] active run ao criar novo terminou como {status}; usando fallback.")
                     return await _chat_fallback(user_message)
-                # anterior terminou -> tenta criar de novo
                 continue
-
             try:
                 run_resp.raise_for_status()
             except Exception as exc:
                 print(f"[openai] erro ao criar run: {exc} body={run_resp.text}")
-                # fallback final
                 return await _chat_fallback(user_message)
             break
 
@@ -186,12 +194,12 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
             print(f"[openai] run terminou como {status}; fallback.")
             return await _chat_fallback(user_message)
 
-        # 4) Busca mensagens e extrai texto
+        # 4) Busca mensagens da thread e extrai a última resposta do assistente
         try:
             msgs = await client.get(
                 f"{_BASE_URL}/threads/{thread_id}/messages",
                 headers=_headers_assistants(),
-                params={"limit": 20},
+                params={"limit": 20, "order": "desc"},
             )
             msgs.raise_for_status()
             data = msgs.json().get("data", [])
@@ -210,5 +218,5 @@ async def ask_assistant(thread_id: str, user_message: str) -> Optional[str]:
                                 return txt
                 elif isinstance(contents, str):
                     return contents
-
+        # se não achou texto válido, usa o fallback
         return await _chat_fallback(user_message)
