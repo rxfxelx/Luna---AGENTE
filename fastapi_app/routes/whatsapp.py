@@ -1,32 +1,13 @@
+# fastapi_app/routes/whatsapp.py
 """
-Webhook e endpoints para a integração WhatsApp (Uazapi).
-
-- HEAD/GET/POST em '' e '/' (prefixo é montado no main.py).
-- Autenticação por token (query 'token', header 'X-Webhook-Token' ou 'hub.verify_token').
-
-Novidades:
-- Parser reforçado para cliques de BOTÕES (buttons/list/interactive).
-- Branch explícito:
-    * Clique "SIM" -> envia VÍDEO (LUNA_VIDEO_URL) + mensagem pós‑vídeo (opcional).
-    * Clique "NÃO" -> encerra com LUNA_END_TEXT.
-- Processamento em background (evita 499).
-
-ENVs relevantes:
-- LUNA_MENU_YES: texto(s) do botão SIM (ex.: "Sim, pode continuar")
-- LUNA_MENU_NO:  texto(s) do botão NÃO (ex.: "Não, encerrar contato")
-- LUNA_VIDEO_URL: URL .mp4 do vídeo
-- LUNA_VIDEO_CAPTION: legenda do vídeo (opcional)
-- LUNA_VIDEO_AFTER_TEXT: texto enviado após o vídeo (opcional)
-- LUNA_END_TEXT: mensagem de encerramento (opcional)
+Webhook e endpoints para WhatsApp (Uazapi) — com execução de tools do Assistant.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
-import unicodedata
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
@@ -37,34 +18,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db import get_db, SessionLocal
 from ..models.db_models import Message, User
 from ..services.openai_service import ask_assistant, get_or_create_thread
-from ..services.uazapi_service import send_whatsapp_message, send_video
+from ..services.uazapi_service import send_whatsapp_message
 
 router = APIRouter(tags=["whatsapp-webhook"])
 
-# --------------------------- ENVs p/ menu/vídeo ---------------------------
-MENU_YES = os.getenv("LUNA_MENU_YES", "Sim, pode continuar")
-MENU_NO = os.getenv("LUNA_MENU_NO", "Não, encerrar contato")
-
-VIDEO_URL = os.getenv("LUNA_VIDEO_URL", "").strip()
-VIDEO_CAPTION = os.getenv("LUNA_VIDEO_CAPTION", "Esse é um exemplo do que produzimos. Faz sentido avançarmos?")
-VIDEO_AFTER_TEXT = os.getenv("LUNA_VIDEO_AFTER_TEXT", "").strip()
-END_TEXT = os.getenv("LUNA_END_TEXT", "Obrigado! Se precisar no futuro, conte com a gente.")
-
-def _normalize_text(s: str) -> str:
-    s = s or ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    return s.lower().strip()
-
-YES_SET = {_normalize_text(x) for x in re.split(r"[|,]", MENU_YES) if x.strip()}
-NO_SET = {_normalize_text(x) for x in re.split(r"[|,]", MENU_NO) if x.strip()}
-
 # --------------------------- Auth helpers ---------------------------
-
 def _env_token() -> str:
     token = os.getenv("WEBHOOK_VERIFY_TOKEN", "")
     if not token:
-        print("[warn] WEBHOOK_VERIFY_TOKEN is not set; webhook will accept any request if token not enforced.")
+        print("[warn] WEBHOOK_VERIFY_TOKEN is not set; webhook aceitará qualquer request se não for reforçado.")
     return token
 
 def _extract_token_from_request(request: Request, header_token: Optional[str]) -> Optional[str]:
@@ -85,16 +47,13 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Invalid webhook token")
 
 # --------------------------- Payload helpers ---------------------------
-
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
 TEXT_KEYS_PRIORITY = (
-    # Baileys-like (texto puro)
     "data.data.messages.0.message.conversation",
     "data.data.messages.0.message.extendedTextMessage.text",
     "messages.0.message.conversation",
     "messages.0.message.extendedTextMessage.text",
-    # Uazapi simples
     "messages.0.text",
     "data.text",
     "data.message",
@@ -104,13 +63,6 @@ TEXT_KEYS_PRIORITY = (
     "body",
     "content",
     "caption",
-    # Botões/list/interactive (muito comuns)
-    "data.data.messages.0.message.buttonsResponseMessage.selectedDisplayText",
-    "data.data.messages.0.message.templateButtonReplyMessage.selectedId",
-    "data.data.messages.0.message.listResponseMessage.title",
-    "data.data.messages.0.message.listResponseMessage.description",
-    "data.data.messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
-    "data.data.messages.0.message.interactiveResponseMessage.nativeFlowResponseMessage.paramsJson",
 )
 
 def _only_digits(s: str) -> str:
@@ -136,10 +88,6 @@ def _deep_get(dct: Dict[str, Any], path: str, default=None):
     return cur
 
 def _norm_phone_from_jid(value: Any) -> Optional[str]:
-    """
-    '<digits>@s.whatsapp.net' | '<digits>@c.us' | '<digits>' (>=10)
-    Ignora grupos '@g.us'.
-    """
     if not isinstance(value, str):
         return None
     v = value.strip()
@@ -176,21 +124,9 @@ def _scan_for_phone(obj: Any) -> Optional[str]:
 def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
     for path in TEXT_KEYS_PRIORITY:
         val = _deep_get(event, path)
-        # casos de paramsJson (interactive) -> normalmente é um JSON string
-        if path.endswith("paramsJson") and isinstance(val, str):
-            try:
-                jd = json.loads(val)
-                # alguns providers enviam {"id": "...", "title": "..."} ou estrutura similar
-                for k in ("title", "text", "display_text", "selectedText"):
-                    if isinstance(jd, dict) and isinstance(jd.get(k), str) and jd[k].strip():
-                        return jd[k].strip()
-            except Exception:
-                pass
         if isinstance(val, str) and val.strip():
             return val.strip()
-
-    # varredura ampla por chaves típicas
-    keys = {"text", "message", "body", "content", "caption", "conversation", "selectedText", "selectedDisplayText"}
+    keys = {"text", "message", "body", "content", "caption", "conversation"}
     found: Optional[str] = None
     def walk(x: Any):
         nonlocal found
@@ -292,8 +228,6 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
     return {"phone": phone, "msg_type": msg_type, "text": text}
 
-# --------------------------- DB helpers ---------------------------
-
 async def _get_or_create_user(session: AsyncSession, phone: str, name: Optional[str]) -> User:
     res = await session.execute(select(User).where(User.phone == phone))
     user = res.scalar_one_or_none()
@@ -304,8 +238,7 @@ async def _get_or_create_user(session: AsyncSession, phone: str, name: Optional[
         await session.refresh(user)
     return user
 
-# ================== endpoints ('' e '/') para evitar 307 ==================
-
+# ================== endpoints ("" e "/") ==================
 @router.head("")
 @router.head("/")
 async def head_check(
@@ -327,68 +260,47 @@ async def get_verify(
         return PlainTextResponse(hub_challenge, status_code=200, media_type="text/plain")
     return JSONResponse({"ok": True})
 
-# --------------------------- Worker assíncrono ---------------------------
-
-async def _process_message_async(payload: Dict[str, Any], phone: str, msg_type: str, text: Optional[str], push_name: Optional[str]) -> None:
-    """Processa a mensagem fora do ciclo do request para evitar timeouts/499."""
+# -------------------- Processamento em background --------------------
+async def _process_message_async(phone: str, msg_type: str, text: Optional[str], push_name: Optional[str]) -> None:
     try:
-        async with SessionLocal() as session:
+        async with SessionLocal() as session:  # nova sessão
             user = await _get_or_create_user(session, phone=phone, name=push_name)
 
-            # 1) Se for clique em BOTÃO "SIM/continuar" -> envia vídeo e (opcional) follow-up
-            norm_text = _normalize_text(text or "")
-            if norm_text in YES_SET and VIDEO_URL:
-                # registra "envio de vídeo"
-                out = Message(user_id=user.id, sender="assistant", content=f"[video] {VIDEO_URL}", media_type="video", media_url=VIDEO_URL)
-                session.add(out)
-                await session.commit()
+            reply_text: Optional[str] = None
+            did_tool = False
 
-                try:
-                    await send_video(phone=phone, url=VIDEO_URL, caption=VIDEO_CAPTION)
-                except Exception as e:
-                    print(f"[uazapi] send video failed: {e!r}")
-
-                if VIDEO_AFTER_TEXT:
-                    try:
-                        await send_whatsapp_message(phone=phone, content=VIDEO_AFTER_TEXT, type_="text")
-                        out2 = Message(user_id=user.id, sender="assistant", content=VIDEO_AFTER_TEXT, media_type="text")
-                        session.add(out2)
-                        await session.commit()
-                    except Exception as e:
-                        print(f"[uazapi] after_text failed: {e!r}")
-                return
-
-            # 2) Clique em BOTÃO "NÃO/encerrar" -> encerra
-            if norm_text in NO_SET:
-                try:
-                    await send_whatsapp_message(phone=phone, content=END_TEXT, type_="text")
-                except Exception as e:
-                    print(f"[uazapi] end_text failed: {e!r}")
-                out = Message(user_id=user.id, sender="assistant", content=END_TEXT, media_type="text")
-                session.add(out)
-                await session.commit()
-                return
-
-            # 3) Fluxo padrão (OpenAI)
             if msg_type == "text" and text:
                 thread_id = await get_or_create_thread(session, user)  # (session, user)
-                reply_text = await ask_assistant(thread_id, text) or "Desculpe, não consegui processar sua mensagem agora."
+                result = await ask_assistant(thread_id, text, phone=phone)
+                reply_text = result.get("text")
+                did_tool = bool(result.get("did_tool"))
             else:
+                # Conteúdo não-texto: apenas acusar recebimento
                 reply_text = "Arquivo recebido com sucesso. Já estou processando! ✅"
 
-            out_msg = Message(user_id=user.id, sender="assistant", content=reply_text, media_type="text")
-            session.add(out_msg)
-            await session.commit()
-
-            try:
-                await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
-            except Exception as e:
-                print(f"[uazapi] send failed (bg): {e!r}")
+            # se houver texto do assistente, registramos e enviamos
+            if reply_text:
+                out_msg = Message(user_id=user.id, sender="assistant", content=reply_text, media_type="text")
+                session.add(out_msg)
+                await session.commit()
+                try:
+                    await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
+                except Exception as e:
+                    print(f"[uazapi] send failed (bg): {e!r}")
+            else:
+                # Não enviar fallback se apenas executamos tools (menu/vídeo)
+                if not did_tool:
+                    fallback = "Desculpe, não consegui processar sua mensagem agora."
+                    out_msg = Message(user_id=user.id, sender="assistant", content=fallback, media_type="text")
+                    session.add(out_msg)
+                    await session.commit()
+                    try:
+                        await send_whatsapp_message(phone=phone, content=fallback, type_="text")
+                    except Exception as e:
+                        print(f"[uazapi] send failed (bg/fallback): {e!r}")
 
     except Exception as exc:
         print(f"[bg] unexpected error: {exc!r}")
-
-# --------------------------- POST (webhook) ---------------------------
 
 @router.post("")
 @router.post("/")
@@ -409,7 +321,7 @@ async def webhook_post(
 
     info = _extract_sender_and_type(payload)
     phone = info.get("phone")
-    msg_type = info.get("msg_type")
+    msg_type = info.get("msg_type") or "unknown"
     text = info.get("text")
 
     print(f"[webhook] extracted phone={phone} type={msg_type} text_len={(len(text) if text else 0)}")
@@ -420,20 +332,20 @@ async def webhook_post(
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
 
-    # registra a mensagem recebida (entrada)
+    # registra a mensagem de entrada rapidamente
     user = await _get_or_create_user(db, phone=phone, name=push_name)
     in_msg = Message(
         user_id=user.id,
         sender="user",
         content=text if msg_type == "text" else None,
-        media_type=msg_type or "unknown",
+        media_type=msg_type,
         media_url=None,
     )
     db.add(in_msg)
     await db.commit()
 
-    # processa em background
-    asyncio.create_task(_process_message_async(payload=payload, phone=phone, msg_type=msg_type or "unknown", text=text, push_name=push_name))
+    # dispara processamento em background e ACK imediato
+    asyncio.create_task(_process_message_async(phone=phone, msg_type=msg_type, text=text, push_name=push_name))
     return JSONResponse({"received": True}, status_code=200)
 
 def get_router() -> APIRouter:
