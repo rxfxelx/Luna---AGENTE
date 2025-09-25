@@ -159,9 +159,8 @@ async def send_whatsapp_message(
 ) -> Dict[str, Any]:
     """
     Envia mensagem via Uazapi com múltiplas tentativas (endpoints/payloads).
-    - Texto: prioriza {"number": "<digits>", "text": content}.
-    - Mídia: aceita variações: {"file": url} | {"url": url} | {"fileUrl": url}
-             e também "type" + "caption".
+    - Texto: prioriza {"number","text"}, {"phone","text"} e variações com chatId.
+    - Mídia: aceita variações {"file": url}, {"url": url}, {"fileUrl": url}, e "caption".
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
@@ -171,9 +170,7 @@ async def send_whatsapp_message(
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
         # ---------------- TEXT ----------------
         if type_ == "text" or not media_url:
-            # /send/text e variações
             for endpoint in _text_endpoints():
-                # JSON + FORM
                 json_payloads = [
                     {"number": digits, "text": content},
                     {"phone": digits, "text": content},
@@ -189,11 +186,9 @@ async def send_whatsapp_message(
         # ---------------- MEDIA ----------------
         mime = mime_type or _infer_mime_from_url(media_url)
         for endpoint in _media_endpoints():
-            # Prioriza o shape que você usa no n8n:
-            #   number + type + file (URL)  (form ou json).  :contentReference[oaicite:2]{index=2}
             payloads: Tuple[Dict[str, Any], ...] = (
                 {"number": digits, "type": "video", "file": media_url, "caption": caption or content},
-                {"number": digits, "file": media_url, "caption": caption or content},  # sem "type"
+                {"number": digits, "file": media_url, "caption": caption or content},
                 {"phone": digits, "file": media_url, "caption": caption or content},
                 {"number": digits, "url": media_url, "caption": caption or content},
                 {"number": digits, "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
@@ -217,15 +212,16 @@ async def send_menu_interesse(
 ) -> Dict[str, Any]:
     """
     Envia caixinha (botões) usando /send/menu com múltiplos formatos:
-      - {"number","type":"button","text","choices":[...],"footerText"} ← (é o que seu n8n usa)  :contentReference[oaicite:3]{index=3}
+      - {"number","type":"button","text","choices":[...],"footerText"}
       - {"number","type":"button","text","buttons":[{"id","title"},...]}
-      - {"number","text","button1Label","button2Label"} (fallback bem comum)
+      - {"number","text","button1Label","button2Label"}
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
 
     digits = _only_digits(phone) or phone
 
+    # JSON e FORM: variações
     json_variants = [
         {
             "number": digits,
@@ -240,22 +236,28 @@ async def send_menu_interesse(
             "text": text,
             "buttons": [
                 {"id": "yes", "title": yes_label},
-                {"id": "no", "title": no_label},
+                {"id": "no",  "title": no_label},
             ],
             **({"footerText": footer_text} if footer_text else {}),
         },
-        # Fallbacks "legados"
+        # Fallback antigo
         {
             "number": digits,
             "text": text,
             "button1Label": yes_label,
             "button2Label": no_label,
         },
-        {"phone": digits, "type": "button", "text": text, "choices": [yes_label, no_label]},
+        # Variação "phone"
+        {
+            "phone": digits,
+            "type": "button",
+            "text": text,
+            "choices": [yes_label, no_label],
+            **({"footerText": footer_text} if footer_text else {}),
+        },
     ]
 
-    # FORM usa as mesmas chaves
-    form_variants = json_variants
+    form_variants = json_variants  # os mesmos payloads servem como form
 
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
         for endpoint in _menu_endpoints():
@@ -266,7 +268,7 @@ async def send_menu_interesse(
 
     raise RuntimeError("Uazapi menu send failed")
 
-# Alias de retrocompatibilidade
+# Alias antigo
 async def send_message(
     *,
     phone: str,
