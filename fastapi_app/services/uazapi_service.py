@@ -7,6 +7,7 @@ Expõe:
 - send_menu_interesse(phone, text, yes_label, no_label, footer_text=None)
 - send_message(...) -> alias compatível (usa send_whatsapp_message)
 - upload_file_to_baserow(media_url) -> Optional[dict]
+- normalize_number(phone) -> compatibilidade com módulos antigos
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ UAZAPI_SEND_MENU_PATH = os.getenv("UAZAPI_SEND_MENU_PATH", "/send/menu")
 _TEXT_FALLBACKS = ["/send/message", "/api/sendText", "/sendText", "/messages/send", "/message/send"]
 _MEDIA_FALLBACKS = ["/send/file", "/api/sendFile", "/api/sendMedia"]
 
-
 # -------------------- Helpers --------------------
 def _ensure_leading_slash(path: str) -> str:
     return path if path.startswith("/") else f"/{path}"
@@ -40,8 +40,10 @@ def _ensure_leading_slash(path: str) -> str:
 def _only_digits(s: str) -> str:
     return "".join(ch for ch in str(s) if ch.isdigit())
 
-# Backward-compat: alguns módulos antigos importam "normalize_number" daqui
 def normalize_number(s: str) -> str:  # noqa: N802
+    """
+    Compatibilidade com módulos antigos: remove tudo exceto dígitos.
+    """
     return _only_digits(s)
 
 def _dedup(seq: Iterable[str]) -> list[str]:
@@ -117,7 +119,6 @@ def _media_endpoints() -> list[str]:
     candidates = [UAZAPI_SEND_MEDIA_PATH, "/send/media"] + _MEDIA_FALLBACKS
     return _dedup(candidates)
 
-
 # -------------------- Senders --------------------
 async def send_whatsapp_message(
     phone: str,
@@ -175,14 +176,14 @@ async def send_whatsapp_message(
             for endpoint in _media_endpoints():
                 if endpoint == "/send/media":
                     candidates = [
-                        {"number": digits, "url": media_url, "caption": caption or content},  # preferido
+                        {"number": digits, "url": media_url, "caption": caption or content},
                         {"phone": digits, "url": media_url, "caption": caption or content},
                         {
                             "chatId": f"{digits}@c.us",
                             "fileUrl": media_url,
                             "mimeType": mime,
                             "caption": caption or content,
-                        },  # fallback
+                        },
                     ]
                 else:
                     candidates = [
@@ -272,7 +273,6 @@ async def send_message(
             phone=phone, content=text, type_="media", media_url=media_url, mime_type=mime_type, caption=text
         )
     return await send_whatsapp_message(phone=phone, content=text, type_="text")
-
 
 # -------------------- Baserow (opcional) --------------------
 BASEROW_BASE_URL = os.getenv("BASEROW_BASE_URL", "").rstrip("/")
