@@ -6,6 +6,12 @@ Fluxo chave desta versão:
 - Caixinha e Vídeo têm helpers explícitos e são registrados no histórico
   com media_type = "menu" / "video", para podermos detectar o "estado"
   via banco (última interação do assistente).
+
+Ajustes desta revisão:
+- Detecta "convite do Passo 3" no texto da IA (ex.: "posso te mostrar", "quer ver um exemplo",
+  "te mostro em 30s", "posso enviar?") e envia automaticamente a CAIXINHA após o texto.
+- Se o usuário responder "sim" logo após um "convite do Passo 3" (mesmo sem menu registrado),
+  envia o VÍDEO imediatamente (evita travar o fluxo).
 """
 
 from __future__ import annotations
@@ -73,7 +79,6 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
 
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
-# 1) Campos de TEXTO mais comuns + respostas de BOTÕES/LISTAS
 TEXT_KEYS_PRIORITY = (
     # Baileys-like
     "data.data.messages.0.message.conversation",
@@ -90,20 +95,6 @@ TEXT_KEYS_PRIORITY = (
     "body",
     "content",
     "caption",
-)
-# chaves específicas de respostas interativas (botões/listas) em variações comuns
-BUTTON_TEXT_KEYS = (
-    "data.body.message.buttonOrListid",
-    "body.message.buttonOrListid",
-    "data.data.messages.0.message.buttonsResponseMessage.selectedDisplayText",
-    "messages.0.message.buttonsResponseMessage.selectedDisplayText",
-    "data.data.messages.0.message.buttonsResponseMessage.buttonText.displayText",
-    "data.data.messages.0.message.templateButtonReplyMessage.selectedId",
-    "messages.0.message.templateButtonReplyMessage.selectedId",
-    "data.data.messages.0.message.listResponseMessage.title",
-    "messages.0.message.listResponseMessage.title",
-    "data.data.messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
-    "messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
 )
 
 def _only_digits(s: str) -> str:
@@ -176,47 +167,11 @@ def _scan_for_phone(obj: Any) -> Optional[str]:
     walk(obj)
     return _only_digits(found_plain) if found_plain else None
 
-def _extract_button_text(event: Dict[str, Any]) -> Optional[str]:
-    """Tenta extrair o texto de resposta de BOTÕES/LISTAS nas variações mais comuns."""
-    for path in BUTTON_TEXT_KEYS:
-        val = _deep_get(event, path)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-
-    # varredura ampla por chaves indicativas (button/list/select)
-    found: Optional[str] = None
-    def walk(x: Any):
-        nonlocal found
-        if found:
-            return
-        if isinstance(x, dict):
-            for k, v in x.items():
-                kl = str(k).lower()
-                if isinstance(v, str) and any(tok in kl for tok in ("button", "list", "selected", "choice", "reply")):
-                    if v.strip():
-                        found = v.strip()
-                        return
-                walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk(v)
-    walk(event)
-    return found
-
 def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
-    # 1) primeiro tenta texto de botões/listas
-    btn = _extract_button_text(event)
-    if btn:
-        # Log leve para debugging
-        print(f"[webhook] detected button/list reply: {btn[:80]}")
-        return btn
-
-    # 2) caminhos “normais” de texto
     for path in TEXT_KEYS_PRIORITY:
         val = _deep_get(event, path)
         if isinstance(val, str) and val.strip():
             return val.strip()
-
     keys = {"text", "message", "body", "content", "caption", "conversation"}
     found: Optional[str] = None
     def walk(x: Any):
@@ -297,7 +252,6 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
     text = _extract_text_generic(event)
 
-    # Se veio qualquer “conteúdo” textual (incluindo botão/lista), tratamos como texto
     if text:
         msg_type = "text"
     else:
@@ -310,11 +264,7 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
         elif _deep_get(event, "data.data.messages.0.message.documentMessage") or event.get("document"):
             msg_type = "pdf"
         else:
-            # em alguns provedores, a resposta de botão só traz ids; ainda assim considere 'text'
-            if any(_deep_get(event, p) is not None for p in BUTTON_TEXT_KEYS):
-                msg_type = "text"
-            else:
-                msg_type = "unknown"
+            msg_type = "unknown"
 
     if phone:
         digits = _only_digits(phone)
@@ -362,15 +312,40 @@ def _is_positive_reply(text: Optional[str]) -> bool:
     t = _normalize(text)
     if t in {_normalize(LUNA_MENU_YES), "sim"}:
         return True
-    if any(e in text for e in _POSITIVE_EMOJIS):
+    if any(e in (text or "") for e in _POSITIVE_EMOJIS):
         return True
     if t in _POSITIVE_WORDS:
         return True
+    # padrões úteis
     if "pode" in t or "mostra" in t or "mostrar" in t or "envia" in t or "enviar" in t or "manda" in t:
         return True
     if "video" in t or "vídeo" in t:
         return True
     return False
+
+def _looks_like_step3_invite(text: Optional[str]) -> bool:
+    """
+    Detecta mensagens típicas do Passo 3 (convite para enviar exemplo/case/vídeo curto).
+    Exemplos: "posso te mostrar", "quer ver um exemplo", "posso apresentar um case",
+    "te mostro em 30s", "quer ver em 30 segundos", "posso enviar?".
+    """
+    if not text:
+        return False
+    t = _normalize(text)
+    patterns = [
+        "posso te mostrar",
+        "quer ver um exemplo",
+        "posso apresentar um case",
+        "te mostro em 30",
+        "quer ver em 30",
+        "30s",
+        "30 segundos",
+        "posso enviar",
+        "posso apresentar",
+        "te mostro",
+        "case curto",
+    ]
+    return any(p in t for p in patterns)
 
 async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
     if not LUNA_MENU_TEXT:
@@ -394,7 +369,6 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
         await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
         return
     try:
-        # tenta mídia
         await send_whatsapp_message(
             phone=phone,
             content=LUNA_VIDEO_CAPTION or "",
@@ -410,11 +384,6 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
             await session.commit()
     except Exception as exc:
         print(f"[video] falha ao enviar vídeo: {exc!r}")
-        # fallback: envia link do vídeo como texto
-        try:
-            await send_whatsapp_message(phone=phone, content=f"{LUNA_VIDEO_CAPTION or ''}\n{LUNA_VIDEO_URL}", type_="text")
-        except Exception as e2:
-            print(f"[video] falha no fallback texto: {e2!r}")
 
 def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool]:
     if not reply_text:
@@ -459,23 +428,31 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.commit()
                 await session.refresh(user)
 
-            # 1) Guard-rail: se resposta POSITIVA após caixinha -> envia VÍDEO e encerra
-            if msg_type == "text" and _is_positive_reply(text) and await _has_recent_menu(session, user.id, minutes=30):
-                print("[flow] positive reply after menu -> sending video")
-                await _enviar_video(session, phone, user)
-                return
-
-            # 1.5) Fallback determinístico para caixinha logo após Passo 2 (pergunta de setor)
-            if msg_type == "text" and _is_positive_reply(text) and not await _has_recent_menu(session, user.id, minutes=30):
+            # 0) Carrega última mensagem do assistente (quando necessário)
+            async def _last_assistant_text(u: User) -> str:
                 q = (
                     select(Message)
-                    .where(Message.user_id == user.id, Message.sender == "assistant")
+                    .where(Message.user_id == u.id, Message.sender == "assistant")
                     .order_by(desc(Message.created_at))
                     .limit(1)
                 )
                 r = await session.execute(q)
-                last_assistant = r.scalar_one_or_none()
-                last_text = (last_assistant.content or "") if last_assistant else ""
+                la = r.scalar_one_or_none()
+                return (la.content or "") if la else ""
+
+            # 1) Guard-rail: se resposta POSITIVA após caixinha -> envia VÍDEO e encerra
+            if msg_type == "text" and _is_positive_reply(text) and await _has_recent_menu(session, user.id, minutes=30):
+                await _enviar_video(session, phone, user)
+                return
+
+            # 1.1) Novo: se resposta POSITIVA logo após um convite explícito do Passo 3 -> envia VÍDEO (mesmo sem menu)
+            if msg_type == "text" and _is_positive_reply(text) and not await _has_recent_menu(session, user.id, minutes=30):
+                last_text = _normalize(await _last_assistant_text(user))
+                if _looks_like_step3_invite(last_text) or last_text == _normalize(LUNA_MENU_TEXT):
+                    await _enviar_video(session, phone, user)
+                    return
+
+                # 1.5) Fallback determinístico para caixinha logo após Passo 2 (pergunta de setor)
                 step2_hints = [
                     "responsavel pelo marketing",
                     "parte de marketing/comunicacao",
@@ -483,8 +460,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     "divulgacao e video",
                     "acoes de marketing",
                 ]
-                if any(h in _normalize(last_text) for h in step2_hints):
-                    print("[flow] positive reply after step2 -> sending menu")
+                if any(h in last_text for h in step2_hints):
                     await _enviar_menu(session, phone, user)
                     return
 
@@ -496,15 +472,14 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     reply_text = "Desculpe, não consegui processar sua mensagem agora."
 
                 send_menu_hint, send_video_hint = _parse_tool_hints(reply_text)
+                step3_invite = _looks_like_step3_invite(reply_text)
 
-                if send_menu_hint:
-                    await _enviar_menu(session, phone, user)
-                    return
-
+                # 2.1) Se a IA sinalizou vídeo de forma explícita -> envia vídeo e encerra
                 if send_video_hint:
                     await _enviar_video(session, phone, user)
                     return
 
+                # 2.2) Envia a resposta textual
                 try:
                     await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
                 except Exception as e:
@@ -513,9 +488,14 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 out_msg = Message(user_id=user.id, sender="assistant", content=reply_text, media_type="text")
                 session.add(out_msg)
                 await session.commit()
+
+                # 2.3) Se a resposta textual foi um "convite Passo 3", já disparamos a CAIXINHA
+                if step3_invite or send_menu_hint:
+                    await _enviar_menu(session, phone, user)
+
                 return
 
-            # Mensagens não-texto (áudio/imagem etc.)
+            # 3) Mensagens não-texto (áudio/imagem etc.)
             ack = "Arquivo recebido com sucesso. Já estou processando! ✅"
             try:
                 await send_whatsapp_message(phone=phone, content=ack, type_="text")
