@@ -1,22 +1,32 @@
+# fastapi_app/db.py
 """
-Database configuration and helper functions.
+Configuração do banco (SQLAlchemy + asyncpg) com suporte robusto a SSL na Railway.
 
-This module sets up the asynchronous SQLAlchemy engine and session
-factory. It also normalises the DATABASE_URL so common provider
-formats like 'postgres://...' or 'postgresql://...' are converted to
-the required 'postgresql+asyncpg://' for SQLAlchemy asyncio.
+Problema resolvido:
+- Railway usa proxy com certificado autoassinado.
+- Em asyncpg, mapear 'sslmode=require' diretamente para 'ssl=True' ativa
+  verificação de certificado -> quebra com SSLCertVerificationError.
+- Aqui criamos um SSLContext que cifra a conexão, mas NÃO verifica por padrão
+  (equivalente prático ao comportamento de 'require' do libpq).
+- Opcionalmente, suportamos verificação com CA próprio (verify-ca / verify-full).
 
-Env vars:
-- DATABASE_URL   -> connection string (postgres://, postgresql://, etc.)
-- DB_SSLMODE     -> 'require' (default), 'disable', 'require_noverify', 'verify-ca', 'verify-full'
-- DB_SSLROOTCERT -> path to CA file when using verify-ca/full (optional)
+ENVs aceitos:
+- DATABASE_URL                       (ex.: postgresql://user:pass@host:port/db)
+- DB_SSLMODE=disable|require|prefer|allow|verify-ca|verify-full
+- DB_SSLROOTCERT                     (caminho absoluto p/ arquivo .pem)
+- DB_SSLROOTCERT_B64                 (conteúdo base64 do CA)
+- SQLALCHEMY_ECHO=0|1                (logs SQL)
 """
 
 from __future__ import annotations
 
+import base64
 import os
+import re
 import ssl
-from typing import Any, AsyncGenerator, Dict
+import tempfile
+from contextlib import asynccontextmanager
+from typing import Optional
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -24,77 +34,154 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm import declarative_base
 
+# -------------------------------------------------------------------
+# Base de modelos (suas tabelas estão em fastapi_app/models/db_models.py)
+# -------------------------------------------------------------------
+Base = declarative_base()
 
-def _normalize_db_url(raw_url: str) -> str:
-    """Ensure that the DB URL uses the asyncpg driver."""
-    if not raw_url or not raw_url.strip():
-        raise RuntimeError(
-            "DATABASE_URL is empty or not set. Provide a valid Postgres connection string."
-        )
-    url = raw_url.strip()
-    if url.startswith("postgres://"):
-        url = "postgresql+asyncpg://" + url[len("postgres://") :]
-    elif url.startswith("postgresql://"):
-        url = "postgresql+asyncpg://" + url[len("postgresql://") :]
-    elif url.startswith("postgresql+psycopg2://"):
-        url = "postgresql+asyncpg://" + url[len("postgresql+psycopg2://") :]
-    return url
+# -------------------------------------------------------------------
+# ENV e URLs
+# -------------------------------------------------------------------
+DATABASE_URL_RAW = (os.getenv("DATABASE_URL", "") or "").strip()
+if not DATABASE_URL_RAW:
+    raise RuntimeError("DATABASE_URL não configurada.")
 
+# força driver asyncpg
+ASYNC_DATABASE_URL = re.sub(
+    r"^postgresql\+asyncpg://|^postgresql://",
+    "postgresql+asyncpg://",
+    DATABASE_URL_RAW,
+    count=1,
+)
 
-def _build_connect_args() -> Dict[str, Any]:
+DB_SSLMODE = (os.getenv("DB_SSLMODE", "disable") or "disable").strip().lower()
+DB_SSLROOTCERT = (os.getenv("DB_SSLROOTCERT", "") or "").strip()
+DB_SSLROOTCERT_B64 = (os.getenv("DB_SSLROOTCERT_B64", "") or "").strip()
+
+SQL_ECHO = (os.getenv("SQLALCHEMY_ECHO", "0") or "0").strip() in {"1", "true", "True"}
+
+# -------------------------------------------------------------------
+# SSL helpers
+# -------------------------------------------------------------------
+def _load_ca_from_env() -> Optional[str]:
     """
-    Map DB_SSLMODE to asyncpg's connect_args.
-
-    Modes:
-    - disable            : no SSL
-    - require (default)  : SSL with system CA bundle
-    - require_noverify   : SSL without certificate/hostname verification
-    - verify-ca/full     : SSL with custom CA (provide DB_SSLROOTCERT)
+    Retorna caminho de um arquivo .pem com a cadeia de CA, vindo de:
+      - DB_SSLROOTCERT_B64 (base64)  -> gravamos em /tmp/ca.pem
+      - DB_SSLROOTCERT (path)
     """
-    mode = os.getenv("DB_SSLMODE", "require").lower()
-    ca_path = os.getenv("DB_SSLROOTCERT")
-    if mode in {"disable", "off", "false", "no"}:
-        return {}
-    if mode in {"require_noverify", "noverify", "insecure"}:
+    if DB_SSLROOTCERT_B64:
+        try:
+            data = base64.b64decode(DB_SSLROOTCERT_B64)
+            tmp = tempfile.NamedTemporaryFile(prefix="db_ca_", suffix=".pem", delete=False)
+            tmp.write(data)
+            tmp.flush()
+            tmp.close()
+            return tmp.name
+        except Exception as exc:
+            print(f"[db] falha ao decodificar DB_SSLROOTCERT_B64: {exc!r}")
+            return None
+
+    if DB_SSLROOTCERT and os.path.exists(DB_SSLROOTCERT):
+        return DB_SSLROOTCERT
+
+    return None
+
+
+def _ssl_context_for_mode(mode: str) -> Optional[ssl.SSLContext]:
+    """
+    Cria um SSLContext apropriado para asyncpg.
+    - disable/off -> None (sem TLS)
+    - require/prefer/allow -> TLS sem verificação (equivalente prático a 'require' do libpq)
+    - verify-ca/verify-full -> TLS com verificação via CA fornecido (ou sistema)
+    """
+    m = (mode or "").strip().lower()
+
+    if m in {"disable", "off", "false", "0"}:
+        return None
+
+    if m in {"require", "prefer", "allow"}:
+        # Cifra a conexão SEM validar certificado/hostname
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        return {"ssl": ctx}
-    if mode in {"verify-ca", "verify_full", "verify-full"}:
-        if not ca_path or not os.path.exists(ca_path):
-            raise RuntimeError(
-                "DB_SSLROOTCERT must be set when using verify-ca or verify-full."
-            )
-        ctx = ssl.create_default_context(cafile=ca_path)
-        return {"ssl": ctx}
-    return {"ssl": True}
+        return ctx
+
+    if m in {"verify-ca", "verify_full", "verify-full"}:
+        cafile = _load_ca_from_env()
+        try:
+            # cria contexto que valida o servidor
+            ctx = ssl.create_default_context(cafile=cafile)
+        except Exception:
+            # fallback se cafile inválido; usa store do sistema
+            ctx = ssl.create_default_context()
+
+        # 'verify-full' valida hostname; 'verify-ca' não exige hostname estrito
+        ctx.check_hostname = m in {"verify_full", "verify-full"}
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        return ctx
+
+    # fallback seguro: criptografa sem verificar (igual branch 'require')
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
-DATABASE_URL = _normalize_db_url(os.getenv("DATABASE_URL", ""))
+# -------------------------------------------------------------------
+# Engine & Session
+# -------------------------------------------------------------------
+def _build_engine() -> AsyncEngine:
+    connect_args = {}
+    ssl_ctx = _ssl_context_for_mode(DB_SSLMODE)
+    if ssl_ctx is not None:
+        connect_args["ssl"] = ssl_ctx
 
-engine: AsyncEngine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    future=True,
-    pool_pre_ping=True,
-    connect_args=_build_connect_args(),
-)
-
-SessionLocal = async_sessionmaker(
-    bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
-)
+    eng = create_async_engine(
+        ASYNC_DATABASE_URL,
+        echo=SQL_ECHO,
+        pool_pre_ping=True,
+        future=True,
+        connect_args=connect_args,
+    )
+    return eng
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency yielding an async database session."""
+engine: AsyncEngine = _build_engine()
+SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
+
+
+# -------------------------------------------------------------------
+# FastAPI deps
+# -------------------------------------------------------------------
+@asynccontextmanager
+async def get_db():
+    """
+    Dependência para FastAPI: injeta AsyncSession e garante fechamento.
+    """
     async with SessionLocal() as session:
         yield session
 
 
+# -------------------------------------------------------------------
+# Init / Migrations-like (cria tabelas se não existirem)
+# -------------------------------------------------------------------
 async def init_models() -> None:
-    """Create tables on startup if they don't exist."""
-    from .models.db_models import Base  # noqa: F401
+    """
+    Executa CREATE TABLE IF NOT EXISTS com base no metadata dos modelos.
+    """
+    # Import tardio para registrar os modelos no metadata
+    from .models import db_models  # noqa: F401
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Logs úteis de diagnóstico:
+    _safe_url = re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", DATABASE_URL_RAW)
+    print(f"[startup] DB url(safe)={_safe_url}  DB_SSLMODE={DB_SSLMODE}")
+
+
+async def dispose_engine() -> None:
+    """Fecha o engine (útil em shutdown events)."""
+    await engine.dispose()
