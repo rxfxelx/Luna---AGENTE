@@ -6,8 +6,6 @@ Fluxo chave desta versão:
 - Caixinha e Vídeo têm helpers explícitos e são registrados no histórico
   com media_type = "menu" / "video", para podermos detectar o "estado"
   via banco (última interação do assistente).
-- Heurísticas adicionais: se o Passo 3 vier como TEXTO ("posso te mostrar?"),
-  um "sim" do lead dispara o VÍDEO mesmo sem menu recente.
 """
 
 from __future__ import annotations
@@ -15,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
@@ -45,20 +44,6 @@ LUNA_VIDEO_URL        = _env_str("LUNA_VIDEO_URL", "")
 LUNA_VIDEO_CAPTION    = _env_str("LUNA_VIDEO_CAPTION", "")
 LUNA_VIDEO_AFTER_TEXT = _env_str("LUNA_VIDEO_AFTER_TEXT", "")
 LUNA_END_TEXT         = _env_str("LUNA_END_TEXT", "")
-
-# Padrões textuais do convite (Passo 3) para degradar direto ao vídeo se o menu não foi enviado
-_INVITE_HINTS = {
-    "posso te mostrar",
-    "quer ver um exemplo",
-    "quer ver em 30s",
-    "quer ver em 30 segundos",
-    "posso enviar",
-    "posso apresentar um case",
-    "te mostro em 30 segundos",
-    "posso te mostrar rapidamente",
-    "posso te mostrar um exemplo",
-    "case curto",
-}
 
 # --------------------------- Auth helpers ---------------------------
 
@@ -111,11 +96,18 @@ def _only_digits(s: str) -> str:
     return "".join(ch for ch in s if ch.isdigit())
 
 def _strip_accents(s: str) -> str:
-    tr = str.maketrans(
-        "áàãâäÁÀÃÂÄéèêÉÈÊíìîÍÌÎóòõôöÓÒÕÔÖúùûüÚÙÛÜçÇ",
-        "aaaaaAAAAAeeeEEEiiiIIIoooooOOOOUuuuUUUUcC",
-    )
-    return s.translate(tr)
+    """
+    Remoção robusta de acentos/diacríticos.
+    Evita ValueError do maketrans e funciona com qualquer unicode.
+    """
+    if not s:
+        return s
+    try:
+        # NFD separa letras de diacríticos; removemos todos os "Mn" (Mark, Nonspacing).
+        return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
+    except Exception:
+        # Fallback ultra conservador: retorna s sem modificar (não vamos travar o fluxo).
+        return s
 
 def _normalize(s: str) -> str:
     return _strip_accents((s or "").strip().lower())
@@ -294,10 +286,6 @@ _POSITIVE_WORDS = {
 }
 _POSITIVE_EMOJIS = {"👍", "👌", "✅", "✔️", "✌️", "🤝"}
 
-def _looks_like_invite(text: str) -> bool:
-    t = _normalize(text or "")
-    return any(h in t for h in _INVITE_HINTS)
-
 async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     try:
         q = (
@@ -310,6 +298,7 @@ async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 3
         last = res.scalar_one_or_none()
         if not last or not getattr(last, "created_at", None):
             return False
+        # created_at é naive (UTC). Compare com utcnow naive.
         now = datetime.utcnow()
         last_at = last.created_at
         if getattr(last_at, "tzinfo", None) is not None:
@@ -319,32 +308,11 @@ async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 3
         print(f"[state] erro ao consultar menu recente: {exc!r}")
         return False
 
-async def _sent_recently(session: AsyncSession, user_id: int, media_type: str, seconds: int = 120) -> bool:
-    try:
-        q = (
-            select(Message)
-            .where(Message.user_id == user_id, Message.sender == "assistant", Message.media_type == media_type)
-            .order_by(desc(Message.created_at))
-            .limit(1)
-        )
-        res = await session.execute(q)
-        last = res.scalar_one_or_none()
-        if not last or not getattr(last, "created_at", None):
-            return False
-        now = datetime.utcnow()
-        last_at = last.created_at
-        if getattr(last_at, "tzinfo", None) is not None:
-            last_at = last_at.replace(tzinfo=None)
-        return (now - last_at) <= timedelta(seconds=seconds)
-    except Exception as exc:
-        print(f"[state] erro ao checar envio recente ({media_type}): {exc!r}")
-        return False
-
 def _is_positive_reply(text: Optional[str]) -> bool:
     if not text:
         return False
     t = _normalize(text)
-    if t in { _normalize(LUNA_MENU_YES), "sim" }:
+    if t in {_normalize(LUNA_MENU_YES), "sim"}:
         return True
     if any(e in text for e in _POSITIVE_EMOJIS):
         return True
@@ -360,16 +328,15 @@ def _is_positive_reply(text: Optional[str]) -> bool:
 async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
     if not LUNA_MENU_TEXT:
         return
-    if await _sent_recently(session, user.id, "menu", seconds=120):
-        return
     try:
-        await send_menu_interesse(
+        resp = await send_menu_interesse(
             phone=phone,
             text=LUNA_MENU_TEXT,
             yes_label=LUNA_MENU_YES or "Sim",
             no_label=LUNA_MENU_NO or "Não",
             footer_text=LUNA_MENU_FOOTER or None,
         )
+        print(f"[menu] enviado -> {resp!r}")
         out = Message(user_id=user.id, sender="assistant", content=LUNA_MENU_TEXT, media_type="menu")
         session.add(out)
         await session.commit()
@@ -377,19 +344,18 @@ async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
         print(f"[menu] falha ao enviar menu: {exc!r}")
 
 async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
-    if await _sent_recently(session, user.id, "video", seconds=120):
-        return
     if not LUNA_VIDEO_URL:
         await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
         return
     try:
-        await send_whatsapp_message(
+        resp = await send_whatsapp_message(
             phone=phone,
             content=LUNA_VIDEO_CAPTION or "",
             type_="media",
             media_url=LUNA_VIDEO_URL,
             caption=LUNA_VIDEO_CAPTION or "",
         )
+        print(f"[video] enviado -> {resp!r}")
         session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_URL, media_type="video"))
         await session.commit()
         if LUNA_VIDEO_AFTER_TEXT:
@@ -442,32 +408,23 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.commit()
                 await session.refresh(user)
 
-            # 0) Snapshot do último texto do assistente
-            q_last = (
-                select(Message)
-                .where(Message.user_id == user.id, Message.sender == "assistant")
-                .order_by(desc(Message.created_at))
-                .limit(1)
-            )
-            r_last = await session.execute(q_last)
-            last_assistant: Optional[Message] = r_last.scalar_one_or_none()
-            last_text = _normalize((last_assistant.content if last_assistant else "") or "")
-
             # 1) Guard-rail: se resposta POSITIVA após caixinha -> envia VÍDEO e encerra
             if msg_type == "text" and _is_positive_reply(text) and await _has_recent_menu(session, user.id, minutes=30):
-                print("[flow] positivo + menu recente => enviar vídeo")
                 await _enviar_video(session, phone, user)
                 return
 
-            # 1.1) Degradação elegante: se a última fala do assistente for CONVITE (passo 3),
-            # e o usuário disser "sim", enviamos o VÍDEO mesmo sem menu.
-            if msg_type == "text" and _is_positive_reply(text) and _looks_like_invite(last_text):
-                print("[flow] positivo + convite textual => enviar vídeo (sem menu)")
-                await _enviar_video(session, phone, user)
-                return
-
-            # 1.2) Fallback determinístico: positivo após passo 2 => envia CAIXINHA
+            # 1.5) Fallback determinístico para caixinha logo após Passo 2 (pergunta de setor)
             if msg_type == "text" and _is_positive_reply(text) and not await _has_recent_menu(session, user.id, minutes=30):
+                # olha a última resposta do assistente
+                q = (
+                    select(Message)
+                    .where(Message.user_id == user.id, Message.sender == "assistant")
+                    .order_by(desc(Message.created_at))
+                    .limit(1)
+                )
+                r = await session.execute(q)
+                last_assistant = r.scalar_one_or_none()
+                last_text = (last_assistant.content or "") if last_assistant else ""
                 step2_hints = [
                     "responsavel pelo marketing",
                     "parte de marketing/comunicacao",
@@ -475,8 +432,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     "divulgacao e video",
                     "acoes de marketing",
                 ]
-                if any(h in last_text for h in step2_hints):
-                    print("[flow] positivo + passo2 => enviar caixinha")
+                if any(h in _normalize(last_text) for h in step2_hints):
                     await _enviar_menu(session, phone, user)
                     return
 
@@ -489,24 +445,14 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
                 send_menu_hint, send_video_hint = _parse_tool_hints(reply_text)
 
-                # Se a IA pedir explicitamente
                 if send_menu_hint:
-                    print("[flow] IA pediu caixinha")
                     await _enviar_menu(session, phone, user)
                     return
 
                 if send_video_hint:
-                    print("[flow] IA pediu vídeo")
                     await _enviar_video(session, phone, user)
                     return
 
-                # Heurística: se a própria resposta da IA for um convite, não mande texto – mande caixinha.
-                if _looks_like_invite(reply_text):
-                    print("[flow] resposta IA parece convite => enviar caixinha")
-                    await _enviar_menu(session, phone, user)
-                    return
-
-                # Texto normal
                 try:
                     await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
                 except Exception as e:
@@ -517,7 +463,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.commit()
                 return
 
-            # 3) Mensagens não-texto (áudio/imagem etc.)
+            # Mensagens não-texto (áudio/imagem etc.)
             ack = "Arquivo recebido com sucesso. Já estou processando! ✅"
             try:
                 await send_whatsapp_message(phone=phone, content=ack, type_="text")
@@ -561,7 +507,6 @@ async def webhook_post(
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
 
-    # Persist inbound
     res = await db.execute(select(User).where(User.phone == phone))
     user = res.scalar_one_or_none()
     if not user:
@@ -580,7 +525,6 @@ async def webhook_post(
     db.add(in_msg)
     await db.commit()
 
-    # Processamento em segundo plano
     asyncio.create_task(_process_message_async(phone=phone, msg_type=msg_type, text=text, push_name=push_name))
     return JSONResponse({"received": True}, status_code=200)
 
