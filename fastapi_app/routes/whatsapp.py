@@ -54,7 +54,6 @@ LUNA_STRICT_ASSISTANT = _env_str("LUNA_STRICT_ASSISTANT", "false").lower() == "t
 HANDOFF_NOTIFY_NUMBERS   = _env_str("HANDOFF_NOTIFY_NUMBERS", "")   # ex.: "5531999999999, 5531988888888"
 HANDOFF_NOTIFY_TEMPLATE  = _env_str(
     "HANDOFF_NOTIFY_TEMPLATE",
-    # sem "Última mensagem", conforme sua preferência
     "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
     "Nome: {name}\nTelefone: +{digits}\nOrigem: WhatsApp"
 )
@@ -390,9 +389,13 @@ def _build_handoff_text(user: User, phone: str, last_msg: Optional[str]) -> str:
     name = (user.name or "—").strip()
     last = (last_msg or "—").strip()
     try:
-        return HANDOFF_NOTIFY_TEMPLATE.format(name=name, digits=digits)
+        return HANDOFF_NOTIFY_TEMPLATE.format(name=name, digits=digits, last=last)
     except Exception:
-        return f"Novo lead aguardando contato (Luna — Verbo Vídeo)\nNome: {name}\nTelefone: +{digits}\nOrigem: WhatsApp"
+        # fallback seguro se template estiver inválido
+        return (
+            "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
+            f"Nome: {name}\nTelefone: +{digits}\nOrigem: WhatsApp"
+        )
 
 async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, user_text: Optional[str]) -> None:
     targets = _parse_notify_numbers(HANDOFF_NOTIFY_NUMBERS)
@@ -405,69 +408,34 @@ async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, 
             await send_whatsapp_message(phone=t, content=alert, type_="text")
         except Exception as e:
             print(f"[handoff] falha ao notificar {t}: {e!r}")
+    # registra para evitar repetições
     session.add(Message(user_id=user.id, sender="assistant", content=alert, media_type="handoff"))
     await session.commit()
 
+# --------- Tool-hints ---------
+
+_TOOL_TAG_RE = re.compile(r"\[\[\s*(enviar_[a-z_]+)(?:[^\]]*)\]\]", re.I)
+
 def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool, bool]:
+    """Detecta pedidos de ferramentas no texto do assistant."""
     if not reply_text:
         return (False, False, False)
     t = reply_text.lower()
-    wants_menu = "enviar_caixinha_interesse" in t or ("caixinha" in t and "enviar" in t)
-    wants_video = "enviar_video" in t or ("enviar" in t and "vídeo" in t) or ("mandar" in t and "vídeo" in t)
-    wants_handoff = "enviar_msg" in t or _looks_like_handoff(reply_text)
+    # tags explícitas [[enviar_video]], [[enviar_caixinha_interesse]], [[enviar_msg]]
+    for m in _TOOLS := _TOOL_TAG_RE.findall(reply_text or ""):
+        t += " " + m  # força a detecção pelos nomes
+    wants_menu = ("enviar_caixinha_interesse" in t) or ("caixinha" in t and "enviar" in t)
+    wants_video = ("enviar_video" in t) or (("enviar" in t or "mandar" in t) and ("vídeo" in t or "video" in t))
+    wants_handoff = ("enviar_msg" in t) or _looks_like_handoff(reply_text)
     return (wants_menu, wants_video, wants_handoff)
 
-# --------------------------- AÇÕES (helpers) ---------------------------
-
-async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
-    """Envia a caixinha de interesse e registra estado; fallback para texto."""
-    if not LUNA_MENU_TEXT:
-        print("[menu] LUNA_MENU_TEXT não definido; caixinha foi pulada.")
-        return
-    try:
-        await send_menu_interesse(
-            phone=phone,
-            text=LUNA_MENU_TEXT,
-            yes_label=LUNA_MENU_YES or "Sim",
-            no_label=LUNA_MENU_NO or "Não",
-            footer_text=LUNA_MENU_FOOTER or None,
-        )
-        session.add(Message(user_id=user.id, sender="assistant", content=LUNA_MENU_TEXT, media_type="menu"))
-        await session.commit()
-        print("[menu] enviado com sucesso.")
-    except Exception as exc:
-        print(f"[menu] falha ao enviar menu: {exc!r}")
-        # fallback texto simples (a conversa não fica travada)
-        try:
-            fallback = f"{LUNA_MENU_TEXT}\n\n[{LUNA_MENU_YES}]  |  [{LUNA_MENU_NO}]"
-            await send_whatsapp_message(phone=phone, content=fallback, type_="text")
-            session.add(Message(user_id=user.id, sender="assistant", content=fallback, media_type="text"))
-            await session.commit()
-        except Exception as exc2:
-            print(f"[menu] fallback text failed: {exc2!r}")
-
-async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
-    """Envia o vídeo (ou qualquer mídia da env) e registra estado; envia frase pós‑vídeo."""
-    if not LUNA_VIDEO_URL:
-        await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
-        return
-    try:
-        await send_whatsapp_message(
-            phone=phone,
-            content=LUNA_VIDEO_CAPTION or "",
-            type_="media",
-            media_url=LUNA_VIDEO_URL,
-            caption=LUNA_VIDEO_CAPTION or "",
-        )
-        session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_URL, media_type="video"))
-        await session.commit()
-        print("[video] enviado com sucesso.")
-        if LUNA_VIDEO_AFTER_TEXT:
-            await send_whatsapp_message(phone=phone, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
-            session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_AFTER_TEXT, media_type="text"))
-            await session.commit()
-    except Exception as exc:
-        print(f"[video] falha ao enviar vídeo: {exc!r}")
+def _clean_tool_tags(s: str) -> str:
+    """Remove tags [[enviar_xxx]] e linhas '#tool:xxx' antes de enviar ao usuário."""
+    if not s:
+        return s
+    out = _TOOL_TAG_RE.sub("", s)
+    out = re.sub(r"(?mi)^\s*#\s*tool\s*:\s*\w+\s*$", "", out)
+    return " ".join(out.split())
 
 # --------------------------- Deduplicação de inbound ---------------------------
 
@@ -496,6 +464,50 @@ async def _is_probably_duplicate(db: AsyncSession, user_id: int, text: Optional[
     except Exception as exc:
         print(f"[dedup] erro na checagem de duplicidade: {exc!r}")
         return False
+
+# --------------------------- Ações (menu/vídeo) ---------------------------
+
+async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
+    """Dispara a caixinha de interesse e registra estado."""
+    if not LUNA_MENU_TEXT:
+        print("[menu] LUNA_MENU_TEXT não definido; caixinha foi pulada.")
+        return
+    try:
+        await send_menu_interesse(
+            phone=phone,
+            text=LUNA_MENU_TEXT,
+            yes_label=LUNA_MENU_YES or "Sim",
+            no_label=LUNA_MENU_NO or "Não",
+            footer_text=LUNA_MENU_FOOTER or None,
+        )
+        session.add(Message(user_id=user.id, sender="assistant", content=LUNA_MENU_TEXT, media_type="menu"))
+        await session.commit()
+        print("[menu] enviado com sucesso.")
+    except Exception as exc:
+        print(f"[menu] falha ao enviar menu: {exc!r}")
+
+async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
+    """Dispara o vídeo demonstrativo e registra estado."""
+    if not LUNA_VIDEO_URL:
+        await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
+        return
+    try:
+        await send_whatsapp_message(
+            phone=phone,
+            content=LUNA_VIDEO_CAPTION or "",
+            type_="media",
+            media_url=LUNA_VIDEO_URL,
+            caption=LUNA_VIDEO_CAPTION or "",
+        )
+        session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_URL, media_type="video"))
+        await session.commit()
+        print("[video] enviado com sucesso.")
+        if LUNA_VIDEO_AFTER_TEXT:
+            await send_whatsapp_message(phone=phone, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
+            session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_AFTER_TEXT, media_type="text"))
+            await session.commit()
+    except Exception as exc:
+        print(f"[video] falha ao enviar vídeo: {exc!r}")
 
 # ================== endpoints ('' e '/') para evitar 307 ==================
 @router.head("")
@@ -591,13 +603,13 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     return
 
                 # 1.f) Texto normal
+                safe_text = _clean_tool_tags(reply_text) or "Certo!"
                 try:
-                    await send_whatsapp_message(phone=phone, content=reply_text or "Certo!", type_="text")
+                    await send_whatsapp_message(phone=phone, content=safe_text, type_="text")
                 except Exception as e:
                     print(f"[uazapi] send failed (bg): {e!r}")
 
-                out_msg = Message(user_id=user.id, sender="assistant", content=reply_text or "Certo!", media_type="text")
-                session.add(out_msg)
+                session.add(Message(user_id=user.id, sender="assistant", content=safe_text, media_type="text"))
                 await session.commit()
                 return
 
@@ -607,8 +619,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await send_whatsapp_message(phone=phone, content=ack, type_="text")
             except Exception as e:
                 print(f"[uazapi] send failed (bg): {e!r}")
-            out_msg = Message(user_id=user.id, sender="assistant", content=ack, media_type="text")
-            session.add(out_msg)
+            session.add(Message(user_id=user.id, sender="assistant", content=ack, media_type="text"))
             await session.commit()
 
     except Exception as exc:
@@ -660,14 +671,13 @@ async def webhook_post(
         return JSONResponse({"received": True, "note": "duplicate_dropped"}, status_code=200)
 
     # Persiste inbound
-    in_msg = Message(
+    db.add(Message(
         user_id=user.id,
         sender="user",
         content=text if msg_type == "text" else None,
         media_type=msg_type or "unknown",
         media_url=None,
-    )
-    db.add(in_msg)
+    ))
     await db.commit()
 
     asyncio.create_task(_process_message_async(phone=phone, msg_type=msg_type, text=text, push_name=push_name))
