@@ -1,4 +1,3 @@
-# fastapi_app/routes/whatsapp.py
 """
 Webhook e endpoints para WhatsApp (Uazapi).
 
@@ -101,10 +100,11 @@ def _strip_accents(s: str) -> str:
     if not isinstance(s, str):
         return ""
     try:
-        # remove marcas de combinação
-        return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.category(ch).startswith("M"))
+        return "".join(
+            ch for ch in unicodedata.normalize("NFKD", s)
+            if not unicodedata.category(ch).startswith("M")
+        )
     except Exception:
-        # fallback: retorna original sem alterar
         return s
 
 def _normalize(s: Optional[str]) -> str:
@@ -368,6 +368,9 @@ async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
         print(f"[menu] falha ao enviar menu: {exc!r}")
 
 async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
+    if await _has_recent_video(session, user.id, minutes=30):
+        print(f"[video] não enviou vídeo – já há vídeo recente para {phone}")
+        return
     if not LUNA_VIDEO_URL:
         await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
         print("[video] LUNA_VIDEO_URL ausente – enviou fallback de texto.")
@@ -438,15 +441,12 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
             # 1) Guard-rail: se resposta POSITIVA após caixinha -> envia VÍDEO e encerra
             if msg_type == "text" and _is_positive_reply(text):
                 if await _has_recent_menu(session, user.id, minutes=30):
-                    if not await _has_recent_video(session, user.id, minutes=30):
-                        print(f"[flow] POSITIVO após caixinha -> enviar vídeo ({phone})")
-                        await _enviar_video(session, phone, user)
-                    else:
-                        print(f"[flow] vídeo já enviado recentemente; não duplicar ({phone})")
+                    print(f"[flow] POSITIVO após caixinha -> enviar vídeo ({phone})")
+                    await _enviar_video(session, phone, user)
                     return
 
             # 1.5) Fallback determinístico para caixinha logo após Passo 2 (pergunta de setor)
-            if msg_type == "text" and _is_positive_reply(text) and not await _has_recent_menu(session, user.id, minutes=30):
+            if msg_type == "text" and _is_positive_reply(text):
                 # olha a última resposta do assistente
                 q = (
                     select(Message)
@@ -464,12 +464,10 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     "divulgacao e video",
                     "acoes de marketing",
                 ]
-                if any(h in _normalize(last_text) for h in step2_hints):
+                if any(h in _normalize(last_text) for h in step2_hints) and not await _has_recent_menu(session, user.id, minutes=30):
                     print(f"[flow] POSITIVO após Passo 2 -> enviar caixinha ({phone})")
                     await _enviar_menu(session, phone, user)
                     return
-                else:
-                    print(f"[flow] POSITIVO mas sem caixinha recente e sem pista do Passo 2; segue IA ({phone})")
 
             # 2) Caso contrário, IA (texto)
             if msg_type == "text" and text:
@@ -486,11 +484,8 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     return
 
                 if send_video_hint:
-                    if not await _has_recent_video(session, user.id, minutes=30):
-                        print(f"[flow] hint->enviar_video ({phone})")
-                        await _enviar_video(session, phone, user)
-                    else:
-                        print(f"[flow] hint->vídeo já recente; não duplicar ({phone})")
+                    print(f"[flow] hint->enviar_video ({phone})")
+                    await _enviar_video(session, phone, user)
                     return
 
                 try:
@@ -566,7 +561,7 @@ async def webhook_post(
     db.add(in_msg)
     await db.commit()
 
-    # processa em background (não bloqueia o webhook)
+    # processa em background
     asyncio.create_task(_process_message_async(phone=phone, msg_type=msg_type, text=text, push_name=push_name))
     return JSONResponse({"received": True}, status_code=200)
 
