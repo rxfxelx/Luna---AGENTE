@@ -408,7 +408,6 @@ async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, 
             await send_whatsapp_message(phone=t, content=alert, type_="text")
         except Exception as e:
             print(f"[handoff] falha ao notificar {t}: {e!r}")
-    # registra para evitar repetições
     session.add(Message(user_id=user.id, sender="assistant", content=alert, media_type="handoff"))
     await session.commit()
 
@@ -420,6 +419,50 @@ def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool, bool]:
     wants_video = "enviar_video" in t or ("enviar" in t and "vídeo" in t) or ("mandar" in t and "vídeo" in t)
     wants_handoff = "enviar_msg" in t or _looks_like_handoff(reply_text)
     return (wants_menu, wants_video, wants_handoff)
+
+# --------------------------- AÇÕES (reintroduzidas) ---------------------------
+
+async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
+    """Envia a caixinha de interesse e registra estado 'menu' no histórico."""
+    if not LUNA_MENU_TEXT:
+        print("[menu] LUNA_MENU_TEXT não definido; caixinha foi pulada.")
+        return
+    try:
+        await send_menu_interesse(
+            phone=phone,
+            text=LUNA_MENU_TEXT,
+            yes_label=LUNA_MENU_YES or "Sim",
+            no_label=LUNA_MENU_NO or "Não",
+            footer_text=LUNA_MENU_FOOTER or None,
+        )
+        session.add(Message(user_id=user.id, sender="assistant", content=LUNA_MENU_TEXT, media_type="menu"))
+        await session.commit()
+        print("[menu] enviado com sucesso.")
+    except Exception as exc:
+        print(f"[menu] falha ao enviar menu: {exc!r}")
+
+async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
+    """Envia o vídeo demonstrativo e registra estado 'video'."""
+    if not LUNA_VIDEO_URL:
+        await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
+        return
+    try:
+        await send_whatsapp_message(
+            phone=phone,
+            content=LUNA_VIDEO_CAPTION or "",
+            type_="media",
+            media_url=LUNA_VIDEO_URL,
+            caption=LUNA_VIDEO_CAPTION or "",
+        )
+        session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_URL, media_type="video"))
+        await session.commit()
+        print("[video] enviado com sucesso.")
+        if LUNA_VIDEO_AFTER_TEXT:
+            await send_whatsapp_message(phone=phone, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
+            session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_AFTER_TEXT, media_type="text"))
+            await session.commit()
+    except Exception as exc:
+        print(f"[video] falha ao enviar vídeo: {exc!r}")
 
 # --------------------------- Deduplicação de inbound ---------------------------
 
