@@ -1,3 +1,4 @@
+# fastapi_app/routes/whatsapp.py
 """
 Webhook e endpoints para WhatsApp (Uazapi).
 
@@ -92,25 +93,26 @@ TEXT_KEYS_PRIORITY = (
     "caption",
 )
 
-def _only_digits(s: str) -> str:
-    return "".join(ch for ch in s if ch.isdigit())
+def _only_digits(s: Any) -> str:
+    return "".join(ch for ch in str(s) if ch.isdigit())
 
 def _strip_accents(s: str) -> str:
-    """
-    Remoção robusta de acentos/diacríticos.
-    Evita ValueError do maketrans e funciona com qualquer unicode.
-    """
-    if not s:
-        return s
+    """Remoção robusta de acentos (não explode; funciona com qualquer charset)."""
+    if not isinstance(s, str):
+        return ""
     try:
-        # NFD separa letras de diacríticos; removemos todos os "Mn" (Mark, Nonspacing).
-        return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
+        # remove marcas de combinação
+        return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.category(ch).startswith("M"))
     except Exception:
-        # Fallback ultra conservador: retorna s sem modificar (não vamos travar o fluxo).
+        # fallback: retorna original sem alterar
         return s
 
-def _normalize(s: str) -> str:
-    return _strip_accents((s or "").strip().lower())
+def _normalize(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    s = s.strip().lower()
+    s = _strip_accents(s)
+    return s
 
 def _deep_get(dct: Dict[str, Any], path: str, default=None):
     cur: Any = dct
@@ -298,7 +300,6 @@ async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 3
         last = res.scalar_one_or_none()
         if not last or not getattr(last, "created_at", None):
             return False
-        # created_at é naive (UTC). Compare com utcnow naive.
         now = datetime.utcnow()
         last_at = last.created_at
         if getattr(last_at, "tzinfo", None) is not None:
@@ -308,17 +309,39 @@ async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 3
         print(f"[state] erro ao consultar menu recente: {exc!r}")
         return False
 
+async def _has_recent_video(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
+    try:
+        q = (
+            select(Message)
+            .where(Message.user_id == user_id, Message.sender == "assistant", Message.media_type == "video")
+            .order_by(desc(Message.created_at))
+            .limit(1)
+        )
+        res = await session.execute(q)
+        last = res.scalar_one_or_none()
+        if not last or not getattr(last, "created_at", None):
+            return False
+        now = datetime.utcnow()
+        last_at = last.created_at
+        if getattr(last_at, "tzinfo", None) is not None:
+            last_at = last_at.replace(tzinfo=None)
+        return (now - last_at) <= timedelta(minutes=minutes)
+    except Exception as exc:
+        print(f"[state] erro ao consultar video recente: {exc!r}")
+        return False
+
 def _is_positive_reply(text: Optional[str]) -> bool:
     if not text:
         return False
     t = _normalize(text)
+    if not t:
+        return False
     if t in {_normalize(LUNA_MENU_YES), "sim"}:
         return True
     if any(e in text for e in _POSITIVE_EMOJIS):
         return True
     if t in _POSITIVE_WORDS:
         return True
-    # padrões úteis
     if "pode" in t or "mostra" in t or "mostrar" in t or "envia" in t or "enviar" in t or "manda" in t:
         return True
     if "video" in t or "vídeo" in t:
@@ -327,41 +350,44 @@ def _is_positive_reply(text: Optional[str]) -> bool:
 
 async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
     if not LUNA_MENU_TEXT:
+        print("[menu] LUNA_MENU_TEXT vazio – não enviar caixinha.")
         return
     try:
-        resp = await send_menu_interesse(
+        await send_menu_interesse(
             phone=phone,
             text=LUNA_MENU_TEXT,
             yes_label=LUNA_MENU_YES or "Sim",
             no_label=LUNA_MENU_NO or "Não",
             footer_text=LUNA_MENU_FOOTER or None,
         )
-        print(f"[menu] enviado -> {resp!r}")
         out = Message(user_id=user.id, sender="assistant", content=LUNA_MENU_TEXT, media_type="menu")
         session.add(out)
         await session.commit()
+        print(f"[menu] enviado para {phone}")
     except Exception as exc:
         print(f"[menu] falha ao enviar menu: {exc!r}")
 
 async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
     if not LUNA_VIDEO_URL:
         await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
+        print("[video] LUNA_VIDEO_URL ausente – enviou fallback de texto.")
         return
     try:
-        resp = await send_whatsapp_message(
+        await send_whatsapp_message(
             phone=phone,
             content=LUNA_VIDEO_CAPTION or "",
             type_="media",
             media_url=LUNA_VIDEO_URL,
             caption=LUNA_VIDEO_CAPTION or "",
         )
-        print(f"[video] enviado -> {resp!r}")
         session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_URL, media_type="video"))
         await session.commit()
+        print(f"[video] enviado para {phone}")
         if LUNA_VIDEO_AFTER_TEXT:
             await send_whatsapp_message(phone=phone, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
             session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_AFTER_TEXT, media_type="text"))
             await session.commit()
+            print(f"[video] after-text enviado para {phone}")
     except Exception as exc:
         print(f"[video] falha ao enviar vídeo: {exc!r}")
 
@@ -400,6 +426,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
     """Processa a mensagem fora do ciclo do request para evitar timeouts/499."""
     try:
         async with SessionLocal() as session:
+            # carrega/cria usuário
             res = await session.execute(select(User).where(User.phone == phone))
             user = res.scalar_one_or_none()
             if not user:
@@ -409,9 +436,14 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.refresh(user)
 
             # 1) Guard-rail: se resposta POSITIVA após caixinha -> envia VÍDEO e encerra
-            if msg_type == "text" and _is_positive_reply(text) and await _has_recent_menu(session, user.id, minutes=30):
-                await _enviar_video(session, phone, user)
-                return
+            if msg_type == "text" and _is_positive_reply(text):
+                if await _has_recent_menu(session, user.id, minutes=30):
+                    if not await _has_recent_video(session, user.id, minutes=30):
+                        print(f"[flow] POSITIVO após caixinha -> enviar vídeo ({phone})")
+                        await _enviar_video(session, phone, user)
+                    else:
+                        print(f"[flow] vídeo já enviado recentemente; não duplicar ({phone})")
+                    return
 
             # 1.5) Fallback determinístico para caixinha logo após Passo 2 (pergunta de setor)
             if msg_type == "text" and _is_positive_reply(text) and not await _has_recent_menu(session, user.id, minutes=30):
@@ -433,10 +465,13 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     "acoes de marketing",
                 ]
                 if any(h in _normalize(last_text) for h in step2_hints):
+                    print(f"[flow] POSITIVO após Passo 2 -> enviar caixinha ({phone})")
                     await _enviar_menu(session, phone, user)
                     return
+                else:
+                    print(f"[flow] POSITIVO mas sem caixinha recente e sem pista do Passo 2; segue IA ({phone})")
 
-            # 2) Caso contrário, IA
+            # 2) Caso contrário, IA (texto)
             if msg_type == "text" and text:
                 thread_id = await get_or_create_thread(session, user)
                 reply_text = await ask_assistant(thread_id, text)
@@ -446,11 +481,16 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 send_menu_hint, send_video_hint = _parse_tool_hints(reply_text)
 
                 if send_menu_hint:
+                    print(f"[flow] hint->enviar_caixinha_interesse ({phone})")
                     await _enviar_menu(session, phone, user)
                     return
 
                 if send_video_hint:
-                    await _enviar_video(session, phone, user)
+                    if not await _has_recent_video(session, user.id, minutes=30):
+                        print(f"[flow] hint->enviar_video ({phone})")
+                        await _enviar_video(session, phone, user)
+                    else:
+                        print(f"[flow] hint->vídeo já recente; não duplicar ({phone})")
                     return
 
                 try:
@@ -463,7 +503,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.commit()
                 return
 
-            # Mensagens não-texto (áudio/imagem etc.)
+            # 3) Mensagens não-texto (áudio/imagem etc.) -> ack simples
             ack = "Arquivo recebido com sucesso. Já estou processando! ✅"
             try:
                 await send_whatsapp_message(phone=phone, content=ack, type_="text")
@@ -507,6 +547,7 @@ async def webhook_post(
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
 
+    # salva mensagem do usuário
     res = await db.execute(select(User).where(User.phone == phone))
     user = res.scalar_one_or_none()
     if not user:
@@ -525,6 +566,7 @@ async def webhook_post(
     db.add(in_msg)
     await db.commit()
 
+    # processa em background (não bloqueia o webhook)
     asyncio.create_task(_process_message_async(phone=phone, msg_type=msg_type, text=text, push_name=push_name))
     return JSONResponse({"received": True}, status_code=200)
 
