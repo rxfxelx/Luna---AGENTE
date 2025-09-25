@@ -4,10 +4,11 @@ Webhook e endpoints para WhatsApp (Uazapi).
 
 Fluxo resumido:
 - Sempre encaminha a mensagem do usuário para a IA (Assistant), com contexto do estado (caixinha/vídeo).
-- Envia CAIXINHA/VÍDEO somente quando a IA solicitar (tool-hints). Opcionalmente há fallback:
-  - Se lead disse "SIM" à caixinha e ainda não houve VÍDEO recente, envia vídeo (pode desativar via LUNA_STRICT_ASSISTANT).
-- Deduplicação de webhooks: ignora POST duplicado (mesmo texto/tipo em ≤5s).
-- Anti-duplicação de ações: não reenviar caixinha/vídeo se já houve envio recente.
+- Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints). Fallback opcional para vídeo após SIM na caixinha.
+- Handoff: quando a IA sinaliza (por função "enviar_msg" ou por texto natural),
+  envia mensagem EXTERNA para os consultores (outro chat) com os dados do lead.
+- Deduplicação de webhooks inbound (mesmo texto+tipo ≤ 5s).
+- Anti-duplicação de ações (menu/vídeo/handoff recentes).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import os
 import re
 import unicodedata
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -48,6 +49,14 @@ LUNA_END_TEXT         = _env_str("LUNA_END_TEXT", "")
 
 # Se "true", NÃO usa fallback automático para vídeo após caixinha SIM (tudo 100% IA)
 LUNA_STRICT_ASSISTANT = _env_str("LUNA_STRICT_ASSISTANT", "false").lower() == "true"
+
+# Notificação externa (handoff)
+HANDOFF_NOTIFY_NUMBERS   = _env_str("HANDOFF_NOTIFY_NUMBERS", "")   # ex.: "5531999999999, 5531988888888"
+HANDOFF_NOTIFY_TEMPLATE  = _env_str(
+    "HANDOFF_NOTIFY_TEMPLATE",
+    "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
+    "Nome: {name}\nTelefone: +{digits}\nÚltima mensagem: {last}\nOrigem: WhatsApp"
+)
 
 # --------------------------- Auth helpers ---------------------------
 
@@ -309,6 +318,9 @@ async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 3
 async def _has_recent_video(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "video", minutes)
 
+async def _has_recent_handoff(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
+    return await _has_recent_generic(session, user_id, "handoff", minutes)
+
 def _is_positive_reply(text: Optional[str]) -> bool:
     if not text:
         return False
@@ -339,54 +351,75 @@ def _looks_like_invite(reply_text: str) -> bool:
     t = _normalize(reply_text)
     return any(p in t for p in _INVITE_PATTERNS)
 
-async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
-    if not LUNA_MENU_TEXT:
-        print("[menu] LUNA_MENU_TEXT não definido; caixinha foi pulada.")
-        return
-    try:
-        await send_menu_interesse(
-            phone=phone,
-            text=LUNA_MENU_TEXT,
-            yes_label=LUNA_MENU_YES or "Sim",
-            no_label=LUNA_MENU_NO or "Não",
-            footer_text=LUNA_MENU_FOOTER or None,
-        )
-        out = Message(user_id=user.id, sender="assistant", content=LUNA_MENU_TEXT, media_type="menu")
-        session.add(out)
-        await session.commit()
-        print("[menu] enviado com sucesso.")
-    except Exception as exc:
-        print(f"[menu] falha ao enviar menu: {exc!r}")
+# --------- Handoff helpers ---------
 
-async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
-    if not LUNA_VIDEO_URL:
-        await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
-        return
-    try:
-        await send_whatsapp_message(
-            phone=phone,
-            content=LUNA_VIDEO_CAPTION or "",
-            type_="media",
-            media_url=LUNA_VIDEO_URL,
-            caption=LUNA_VIDEO_CAPTION or "",
-        )
-        session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_URL, media_type="video"))
-        await session.commit()
-        print("[video] enviado com sucesso.")
-        if LUNA_VIDEO_AFTER_TEXT:
-            await send_whatsapp_message(phone=phone, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
-            session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_AFTER_TEXT, media_type="text"))
-            await session.commit()
-    except Exception as exc:
-        print(f"[video] falha ao enviar vídeo: {exc!r}")
-
-def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool]:
+def _looks_like_handoff(reply_text: str) -> bool:
+    """Detecta falas naturais do assistant indicando handoff."""
     if not reply_text:
-        return (False, False)
+        return False
+    t = _normalize(reply_text)
+    patterns = (
+        "vou te colocar em contato",
+        "vou te conectar",
+        "vou te passar para",
+        "encaminharei voce ao nosso consultor",
+        "encaminharei você ao nosso consultor",
+        "encaminhar voce ao consultor",
+        "encaminhar você ao consultor",
+        "colocar voce com um consultor",
+        "colocar você com um consultor",
+        "te coloco com nosso consultor",
+        "vou conectar voce com um especialista",
+        "vou conectar você com um especialista",
+        "encaminhando para o consultor",
+        "enviar_msg",  # função textual
+    )
+    return any(p in t for p in patterns)
+
+def _parse_notify_numbers(raw: str) -> List[str]:
+    nums: List[str] = []
+    for token in re.split(r"[,\s;]+", raw or ""):
+        digits = _only_digits(token)
+        if digits:
+            nums.append(digits)
+    return nums
+
+def _build_handoff_text(user: User, phone: str, last_msg: Optional[str]) -> str:
+    digits = _only_digits(phone)
+    name = (user.name or "—").strip()
+    last = (last_msg or "—").strip()
+    try:
+        return HANDOFF_NOTIFY_TEMPLATE.format(name=name, digits=digits, last=last)
+    except Exception:
+        # fallback seguro se template estiver inválido
+        return (
+            "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
+            f"Nome: {name}\nTelefone: +{digits}\nÚltima mensagem: {last}\nOrigem: WhatsApp"
+        )
+
+async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, user_text: Optional[str]) -> None:
+    targets = _parse_notify_numbers(HANDOFF_NOTIFY_NUMBERS)
+    if not targets:
+        print("[handoff] HANDOFF_NOTIFY_NUMBERS vazio ou inválido; nenhuma notificação enviada.")
+        return
+    alert = _build_handoff_text(user, phone, user_text)
+    for t in targets:
+        try:
+            await send_whatsapp_message(phone=t, content=alert, type_="text")
+        except Exception as e:
+            print(f"[handoff] falha ao notificar {t}: {e!r}")
+    # registra para evitar repetições
+    session.add(Message(user_id=user.id, sender="assistant", content=alert, media_type="handoff"))
+    await session.commit()
+
+def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool, bool]:
+    if not reply_text:
+        return (False, False, False)
     t = reply_text.lower()
     wants_menu = "enviar_caixinha_interesse" in t or ("caixinha" in t and "enviar" in t)
     wants_video = "enviar_video" in t or ("enviar" in t and "vídeo" in t) or ("mandar" in t and "vídeo" in t)
-    return (wants_menu, wants_video)
+    wants_handoff = "enviar_msg" in t or _looks_like_handoff(reply_text)
+    return (wants_menu, wants_video, wants_handoff)
 
 # --------------------------- Deduplicação de inbound ---------------------------
 
@@ -452,8 +485,9 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.refresh(user)
 
             # Estado
-            menu_recent  = await _has_recent_menu(session, user.id, minutes=30)
-            video_recent = await _has_recent_video(session, user.id, minutes=30)
+            menu_recent   = await _has_recent_menu(session, user.id, minutes=30)
+            video_recent  = await _has_recent_video(session, user.id, minutes=30)
+            handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)
 
             # 1) Texto -> consulta IA (sempre), com CONTEXTO do estado
             if msg_type == "text" and text:
@@ -466,7 +500,6 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         "Prossiga com a etapa seguinte do fluxo (pós-vídeo). Mensagem do lead: "
                     )
                 elif menu_recent:
-                    # Detectar intenção do texto
                     tnorm = _normalize(text)
                     if tnorm in {_normalize(LUNA_MENU_YES), "sim"} or "sim" in tnorm:
                         prefix = "Contexto: o lead respondeu SIM na caixinha de interesse. Mensagem do lead: "
@@ -478,33 +511,38 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 ai_input = (prefix + (text or "")).strip()
                 reply_text = await ask_assistant(thread_id, ai_input) or ""
 
-                send_menu_hint, send_video_hint = _parse_tool_hints(reply_text)
+                wants_menu, wants_video, wants_handoff = _parse_tool_hints(reply_text)
 
                 # 1.a) Se a IA pediu caixinha/convite
-                if (send_menu_hint or _looks_like_invite(reply_text)) and not menu_recent:
+                if (wants_menu or _looks_like_invite(reply_text)) and not menu_recent:
                     await _enviar_menu(session, phone, user)
                     return
-                if (send_menu_hint or _looks_like_invite(reply_text)) and menu_recent:
+                if (wants_menu or _looks_like_invite(reply_text)) and menu_recent:
                     print("[guard] IA/convite pediu caixinha, mas já existe recente; ignorando convite.")
 
                 # 1.b) Se a IA pediu VÍDEO -> envia se ainda não houver vídeo recente
-                if send_video_hint and not video_recent:
+                if wants_video and not video_recent:
                     await _enviar_video(session, phone, user)
                     return
-                if send_video_hint and video_recent:
+                if wants_video and video_recent:
                     print("[guard] IA pediu vídeo, mas já enviamos recentemente; ignorando.")
 
-                # 1.c) Fallback (opcional) — vídeo após caixinha SIM (se IA não mandou)
+                # 1.c) HANDOFF: notificar consultores (uma vez por janela)
+                if wants_handoff and not handoff_recent:
+                    await _notify_consultants(session, user=user, phone=phone, user_text=text)
+                    # segue respondendo ao lead com o próprio reply_text do assistant
+
+                # 1.d) Fallback (opcional) — vídeo após caixinha SIM (se IA não mandou)
                 if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
                     await _enviar_video(session, phone, user)
                     return
 
-                # 1.d) Anti-eco (convite) após caixinha
+                # 1.e) Anti-eco (convite) após caixinha
                 if menu_recent and _looks_like_invite(reply_text):
                     print("[guard] menu enviado há pouco; suprimindo texto convite duplicado.")
                     return
 
-                # 1.e) Texto normal
+                # 1.f) Texto normal
                 try:
                     await send_whatsapp_message(phone=phone, content=reply_text or "Certo!", type_="text")
                 except Exception as e:
