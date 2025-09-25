@@ -1,12 +1,11 @@
-# fastapi_app/routes/whatsapp.py
 """
 Webhook e endpoints para WhatsApp (Uazapi).
 
-Ajustes principais:
-- Passa (phone, push_name) para ask_assistant(...), permitindo que o Assistant
-  execute as tools (menu, vídeo, handoff) corretamente.
-- Mantém guard-rails determinísticos (resposta positiva após caixinha -> vídeo).
-- Removeu "hints" de tools por texto para evitar duplicidade com as tools reais.
+Fluxo chave desta versão:
+- Se o usuário responder POSITIVO após a caixinha -> envia o VÍDEO diretamente (sem IA).
+- Caixinha e Vídeo têm helpers explícitos e são registrados no histórico
+  com media_type = "menu" / "video", para podermos detectar o "estado"
+  via banco (última interação do assistente).
 """
 
 from __future__ import annotations
@@ -15,12 +14,12 @@ import asyncio
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from starlette.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.responses import JSONResponse, PlainTextResponse
 
 from ..db import get_db, SessionLocal
 from ..models.db_models import Message, User
@@ -30,7 +29,9 @@ from ..services.uazapi_service import send_whatsapp_message, send_menu_interesse
 router = APIRouter(tags=["whatsapp-webhook"])
 
 # --------------------------- ENV (Luna) ---------------------------
+
 def _env_str(key: str, default: str = "") -> str:
+    # remove espaços e aspas extras vindas do painel do Railway
     return (os.getenv(key, default) or "").strip().strip('"').strip("'")
 
 LUNA_MENU_YES     = _env_str("LUNA_MENU_YES", "Sim, pode continuar")
@@ -44,6 +45,7 @@ LUNA_VIDEO_AFTER_TEXT = _env_str("LUNA_VIDEO_AFTER_TEXT", "")
 LUNA_END_TEXT         = _env_str("LUNA_END_TEXT", "")
 
 # --------------------------- Auth helpers ---------------------------
+
 def _env_token() -> str:
     token = os.getenv("WEBHOOK_VERIFY_TOKEN", "")
     if not token:
@@ -68,13 +70,17 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Invalid webhook token")
 
 # --------------------------- Payload helpers ---------------------------
+
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
+# 1) Campos de TEXTO mais comuns + respostas de BOTÕES/LISTAS
 TEXT_KEYS_PRIORITY = (
+    # Baileys-like
     "data.data.messages.0.message.conversation",
     "data.data.messages.0.message.extendedTextMessage.text",
     "messages.0.message.conversation",
     "messages.0.message.extendedTextMessage.text",
+    # Uazapi simples
     "messages.0.text",
     "data.text",
     "data.message",
@@ -84,6 +90,20 @@ TEXT_KEYS_PRIORITY = (
     "body",
     "content",
     "caption",
+)
+# chaves específicas de respostas interativas (botões/listas) em variações comuns
+BUTTON_TEXT_KEYS = (
+    "data.body.message.buttonOrListid",
+    "body.message.buttonOrListid",
+    "data.data.messages.0.message.buttonsResponseMessage.selectedDisplayText",
+    "messages.0.message.buttonsResponseMessage.selectedDisplayText",
+    "data.data.messages.0.message.buttonsResponseMessage.buttonText.displayText",
+    "data.data.messages.0.message.templateButtonReplyMessage.selectedId",
+    "messages.0.message.templateButtonReplyMessage.selectedId",
+    "data.data.messages.0.message.listResponseMessage.title",
+    "messages.0.message.listResponseMessage.title",
+    "data.data.messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
+    "messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
 )
 
 def _only_digits(s: str) -> str:
@@ -119,6 +139,10 @@ def _deep_get(dct: Dict[str, Any], path: str, default=None):
     return cur
 
 def _norm_phone_from_jid(value: Any) -> Optional[str]:
+    """
+    '<digits>@s.whatsapp.net' | '<digits>@c.us' | '<digits>' (>=10)
+    Ignora grupos '@g.us'.
+    """
     if not isinstance(value, str):
         return None
     v = value.strip()
@@ -152,11 +176,47 @@ def _scan_for_phone(obj: Any) -> Optional[str]:
     walk(obj)
     return _only_digits(found_plain) if found_plain else None
 
+def _extract_button_text(event: Dict[str, Any]) -> Optional[str]:
+    """Tenta extrair o texto de resposta de BOTÕES/LISTAS nas variações mais comuns."""
+    for path in BUTTON_TEXT_KEYS:
+        val = _deep_get(event, path)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    # varredura ampla por chaves indicativas (button/list/select)
+    found: Optional[str] = None
+    def walk(x: Any):
+        nonlocal found
+        if found:
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                kl = str(k).lower()
+                if isinstance(v, str) and any(tok in kl for tok in ("button", "list", "selected", "choice", "reply")):
+                    if v.strip():
+                        found = v.strip()
+                        return
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(event)
+    return found
+
 def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
+    # 1) primeiro tenta texto de botões/listas
+    btn = _extract_button_text(event)
+    if btn:
+        # Log leve para debugging
+        print(f"[webhook] detected button/list reply: {btn[:80]}")
+        return btn
+
+    # 2) caminhos “normais” de texto
     for path in TEXT_KEYS_PRIORITY:
         val = _deep_get(event, path)
         if isinstance(val, str) and val.strip():
             return val.strip()
+
     keys = {"text", "message", "body", "content", "caption", "conversation"}
     found: Optional[str] = None
     def walk(x: Any):
@@ -190,8 +250,9 @@ def _is_from_me(event: Dict[str, Any]) -> bool:
 
 def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     msg = _deep_get(event, "data.data.messages.0") or _deep_get(event, "messages.0") or {}
-    phone: Optional[str] = None
+    message_obj = msg.get("message", {}) if isinstance(msg, dict) else {}
 
+    phone: Optional[str] = None
     for p in (
         _deep_get(msg, "key.remoteJid"),
         msg.get("remoteJid") if isinstance(msg, dict) else None,
@@ -236,6 +297,7 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
     text = _extract_text_generic(event)
 
+    # Se veio qualquer “conteúdo” textual (incluindo botão/lista), tratamos como texto
     if text:
         msg_type = "text"
     else:
@@ -248,7 +310,11 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
         elif _deep_get(event, "data.data.messages.0.message.documentMessage") or event.get("document"):
             msg_type = "pdf"
         else:
-            msg_type = "unknown"
+            # em alguns provedores, a resposta de botão só traz ids; ainda assim considere 'text'
+            if any(_deep_get(event, p) is not None for p in BUTTON_TEXT_KEYS):
+                msg_type = "text"
+            else:
+                msg_type = "unknown"
 
     if phone:
         digits = _only_digits(phone)
@@ -259,6 +325,7 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     return {"phone": phone, "msg_type": msg_type, "text": text}
 
 # --------------------------- POS/Fluxo helpers ---------------------------
+
 _POSITIVE_WORDS = {
     "sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim", "pode continuar",
     "vamos", "bora", "manda", "mande", "envia", "enviar", "segue", "segue sim",
@@ -279,6 +346,7 @@ async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 3
         last = res.scalar_one_or_none()
         if not last or not getattr(last, "created_at", None):
             return False
+        # created_at é naive (UTC). Compare com utcnow naive.
         now = datetime.utcnow()
         last_at = last.created_at
         if getattr(last_at, "tzinfo", None) is not None:
@@ -326,6 +394,7 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
         await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
         return
     try:
+        # tenta mídia
         await send_whatsapp_message(
             phone=phone,
             content=LUNA_VIDEO_CAPTION or "",
@@ -341,17 +410,36 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
             await session.commit()
     except Exception as exc:
         print(f"[video] falha ao enviar vídeo: {exc!r}")
+        # fallback: envia link do vídeo como texto
+        try:
+            await send_whatsapp_message(phone=phone, content=f"{LUNA_VIDEO_CAPTION or ''}\n{LUNA_VIDEO_URL}", type_="text")
+        except Exception as e2:
+            print(f"[video] falha no fallback texto: {e2!r}")
+
+def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool]:
+    if not reply_text:
+        return (False, False)
+    t = reply_text.lower()
+    wants_menu = "enviar_caixinha_interesse" in t or ("caixinha" in t and "enviar" in t)
+    wants_video = "enviar_video" in t or ("enviar" in t and "vídeo" in t) or ("mandar" in t and "vídeo" in t)
+    return (wants_menu, wants_video)
 
 # ================== endpoints ('' e '/') para evitar 307 ==================
 @router.head("")
 @router.head("/")
-async def head_check(request: Request, x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token")) -> Response:
+async def head_check(
+    request: Request,
+    x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token"),
+) -> Response:
     _ensure_authorised(request, x_webhook_token)
     return Response(status_code=200)
 
 @router.get("")
 @router.get("/")
-async def get_verify(request: Request, x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token")) -> Response:
+async def get_verify(
+    request: Request,
+    x_webhook_token: Optional[str] = Header(default=None, alias="X-Webhook-Token"),
+) -> Response:
     _ensure_authorised(request, x_webhook_token)
     hub_challenge = request.query_params.get("hub.challenge")
     if hub_challenge is not None:
@@ -371,13 +459,13 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.commit()
                 await session.refresh(user)
 
-            # 1) Resposta POSITIVA após caixinha -> envia VÍDEO e encerra (guard-rail determinístico)
+            # 1) Guard-rail: se resposta POSITIVA após caixinha -> envia VÍDEO e encerra
             if msg_type == "text" and _is_positive_reply(text) and await _has_recent_menu(session, user.id, minutes=30):
+                print("[flow] positive reply after menu -> sending video")
                 await _enviar_video(session, phone, user)
                 return
 
-            # 1.5) Se resposta positiva e não houve menu recente, mas a última fala do assistant foi o "Passo 2",
-            # envia a caixinha sem depender da IA (deixa o fluxo mais responsivo).
+            # 1.5) Fallback determinístico para caixinha logo após Passo 2 (pergunta de setor)
             if msg_type == "text" and _is_positive_reply(text) and not await _has_recent_menu(session, user.id, minutes=30):
                 q = (
                     select(Message)
@@ -396,15 +484,26 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     "acoes de marketing",
                 ]
                 if any(h in _normalize(last_text) for h in step2_hints):
+                    print("[flow] positive reply after step2 -> sending menu")
                     await _enviar_menu(session, phone, user)
                     return
 
-            # 2) Caso contrário, IA (Assistants v2 + tools)
+            # 2) Caso contrário, IA
             if msg_type == "text" and text:
                 thread_id = await get_or_create_thread(session, user)
-                reply_text = await ask_assistant(thread_id, text, number=phone, lead_name=push_name or None)
+                reply_text = await ask_assistant(thread_id, text)
                 if not reply_text:
                     reply_text = "Desculpe, não consegui processar sua mensagem agora."
+
+                send_menu_hint, send_video_hint = _parse_tool_hints(reply_text)
+
+                if send_menu_hint:
+                    await _enviar_menu(session, phone, user)
+                    return
+
+                if send_video_hint:
+                    await _enviar_video(session, phone, user)
+                    return
 
                 try:
                     await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
@@ -416,8 +515,8 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.commit()
                 return
 
-            # 3) Mensagens não-texto (áudio/imagem etc.) — ACK simples
-            ack = "Arquivo recebido com sucesso. Já estou processando!"
+            # Mensagens não-texto (áudio/imagem etc.)
+            ack = "Arquivo recebido com sucesso. Já estou processando! ✅"
             try:
                 await send_whatsapp_message(phone=phone, content=ack, type_="text")
             except Exception as e:
