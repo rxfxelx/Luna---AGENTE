@@ -1,19 +1,8 @@
 # fastapi_app/services/uazapi_service.py
-"""
-Integração com Uazapi (WhatsApp) e upload opcional para Baserow.
-
-Expõe:
-- send_whatsapp_message(phone, content, type_="text", media_url=None, mime_type=None, caption=None)
-- send_menu_interesse(phone, text, yes_label, no_label, footer_text=None)
-- send_message(...) -> alias compatível (usa send_whatsapp_message)
-- upload_file_to_baserow(media_url) -> Optional[dict]
-- normalize_number(phone) -> compatibilidade com módulos antigos
-"""
-
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, List
 
 import httpx
 
@@ -24,14 +13,22 @@ UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN", "")
 # 'token' | 'apikey' | 'authorization_bearer'
 UAZAPI_AUTH_HEADER_NAME = os.getenv("UAZAPI_AUTH_HEADER_NAME", "token").lower()
 
-# Rotas vindas do ambiente (usadas, mas SEMPRE tentamos '/send/text' primeiro)
+# Rotas vindas do ambiente (usadas, mas SEMPRE tentamos as padrão primeiro)
 UAZAPI_SEND_TEXT_PATH = os.getenv("UAZAPI_SEND_TEXT_PATH", "/send/text")
 UAZAPI_SEND_MEDIA_PATH = os.getenv("UAZAPI_SEND_MEDIA_PATH", "/send/media")
-UAZAPI_SEND_MENU_PATH = os.getenv("UAZAPI_SEND_MENU_PATH", "/send/menu")
+UAZAPI_SEND_MENU_PATH  = os.getenv("UAZAPI_SEND_MENU_PATH",  "/send/menu")
 
 # Fallbacks comuns observados em instalações diferentes
-_TEXT_FALLBACKS = ["/send/message", "/api/sendText", "/sendText", "/messages/send", "/message/send"]
+_TEXT_FALLBACKS  = ["/send/message", "/api/sendText", "/sendText", "/messages/send", "/message/send"]
 _MEDIA_FALLBACKS = ["/send/file", "/api/sendFile", "/api/sendMedia"]
+_MENU_FALLBACKS  = [
+    "/send/menu",
+    "/send/buttons",
+    "/send/button",
+    "/send/interactive",
+    "/api/sendMenu",
+    "/messages/buttons",
+]
 
 # -------------------- Helpers --------------------
 def _ensure_leading_slash(path: str) -> str:
@@ -40,14 +37,11 @@ def _ensure_leading_slash(path: str) -> str:
 def _only_digits(s: str) -> str:
     return "".join(ch for ch in str(s) if ch.isdigit())
 
-def normalize_number(s: str) -> str:  # noqa: N802
-    """
-    Compatibilidade com módulos antigos: remove tudo exceto dígitos.
-    """
+def normalize_number(s: str) -> str:  # compat legado
     return _only_digits(s)
 
-def _dedup(seq: Iterable[str]) -> list[str]:
-    out: list[str] = []
+def _dedup(seq: Iterable[str]) -> List[str]:
+    out: List[str] = []
     seen: set[str] = set()
     for x in seq:
         if not x:
@@ -59,10 +53,6 @@ def _dedup(seq: Iterable[str]) -> list[str]:
     return out
 
 def _headers() -> Dict[str, str]:
-    """
-    Constrói headers aceitando variações de autenticação.
-    Padrão: header 'token'.
-    """
     if not UAZAPI_TOKEN:
         raise RuntimeError("UAZAPI_TOKEN não configurado.")
     base = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -77,12 +67,6 @@ def _headers() -> Dict[str, str]:
     return base
 
 def _chatid_variants(phone: str) -> Iterable[str]:
-    """
-    Gera variantes para diferentes instalações:
-      1) <digits>@c.us   (prioridade para chatId)
-      2) <digits>@s.whatsapp.net
-      3) <digits>        (fallback simples)
-    """
     digits = _only_digits(phone) or phone
     seen = set()
     for v in (f"{digits}@c.us", f"{digits}@s.whatsapp.net", digits):
@@ -108,15 +92,17 @@ def _infer_mime_from_url(url: str) -> str:
         return "audio/ogg"
     return "application/octet-stream"
 
-def _text_endpoints() -> list[str]:
-    """
-    Ordem garantida: '/send/text' SEMPRE primeiro, depois env e fallbacks.
-    """
+def _text_endpoints() -> List[str]:
+    # ordem garantida: '/send/text' primeiro
     candidates = ["/send/text", UAZAPI_SEND_TEXT_PATH] + _TEXT_FALLBACKS
     return _dedup(candidates)
 
-def _media_endpoints() -> list[str]:
-    candidates = [UAZAPI_SEND_MEDIA_PATH, "/send/media"] + _MEDIA_FALLBACKS
+def _media_endpoints() -> List[str]:
+    candidates = ["/send/media", UAZAPI_SEND_MEDIA_PATH] + _MEDIA_FALLBACKS
+    return _dedup(candidates)
+
+def _menu_endpoints() -> List[str]:
+    candidates = ["/send/menu", UAZAPI_SEND_MENU_PATH] + _MENU_FALLBACKS
     return _dedup(candidates)
 
 # -------------------- Senders --------------------
@@ -129,11 +115,6 @@ async def send_whatsapp_message(
     mime_type: Optional[str] = None,
     caption: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Envia mensagem via Uazapi com múltiplas tentativas (endpoints/payloads).
-    - Para '/send/text': prioriza {"number": "<digits>", "text": content}.
-    - Para '/send/media': prioriza {"number": "<digits>", "url": media_url, "caption": ...}.
-    """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
 
@@ -145,9 +126,9 @@ async def send_whatsapp_message(
             for endpoint in _text_endpoints():
                 if endpoint == "/send/text":
                     candidates = [
-                        {"number": digits, "text": content},              # preferido
-                        {"phone": digits, "text": content},               # variação
-                        {"chatId": f"{digits}@c.us", "text": content},    # fallback
+                        {"number": digits, "text": content},           # preferido
+                        {"phone":  digits, "text": content},           # variação
+                        {"chatId": f"{digits}@c.us", "text": content}, # fallback
                     ]
                 else:
                     candidates = []
@@ -160,57 +141,57 @@ async def send_whatsapp_message(
                     try:
                         resp = await client.post(endpoint, json=payload, headers=headers)
                         if resp.status_code < 400:
+                            print(f"[uazapi][text] OK {endpoint} payload_keys={list(payload.keys())}")
                             try:
                                 return resp.json()
                             except Exception:
                                 return {"status": "ok", "http_status": resp.status_code}
                         else:
-                            txt = resp.text[:200].replace("\n", " ")
-                            print(f"[uazapi] {endpoint} {resp.status_code} body={txt}")
+                            print(f"[uazapi][text] {endpoint} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
                     except Exception as exc:
-                        print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
+                        print(f"[uazapi][text] EXC {endpoint} payload={list(payload.keys())}: {exc}")
             raise RuntimeError(f"Uazapi text send failed for phone={phone}")
 
-        else:
-            mime = mime_type or _infer_mime_from_url(media_url)
-            for endpoint in _media_endpoints():
-                if endpoint == "/send/media":
-                    candidates = [
-                        {"number": digits, "url": media_url, "caption": caption or content},
-                        {"phone": digits, "url": media_url, "caption": caption or content},
-                        {
-                            "chatId": f"{digits}@c.us",
-                            "fileUrl": media_url,
-                            "mimeType": mime,
-                            "caption": caption or content,
-                        },
-                    ]
-                else:
-                    candidates = [
-                        {
-                            "chatId": f"{digits}@c.us",
-                            "fileUrl": media_url,
-                            "mimeType": mime,
-                            "caption": caption or content,
-                        },
-                        {"phone": digits, "url": media_url, "caption": caption or content},
-                        {"number": digits, "url": media_url, "caption": caption or content},
-                    ]
+        # media
+        mime = mime_type or _infer_mime_from_url(media_url)
+        for endpoint in _media_endpoints():
+            if endpoint == "/send/media":
+                candidates = [
+                    {"number": digits, "url": media_url, "caption": caption or content},
+                    {"phone":  digits, "url": media_url, "caption": caption or content},
+                    {
+                        "chatId": f"{digits}@c.us",
+                        "fileUrl": media_url,
+                        "mimeType": mime,
+                        "caption": caption or content,
+                    },
+                ]
+            else:
+                candidates = [
+                    {
+                        "chatId": f"{digits}@c.us",
+                        "fileUrl": media_url,
+                        "mimeType": mime,
+                        "caption": caption or content,
+                    },
+                    {"phone":  digits, "url": media_url, "caption": caption or content},
+                    {"number": digits, "url": media_url, "caption": caption or content},
+                ]
 
-                for payload in candidates:
-                    try:
-                        resp = await client.post(endpoint, json=payload, headers=headers)
-                        if resp.status_code < 400:
-                            try:
-                                return resp.json()
-                            except Exception:
-                                return {"status": "ok", "http_status": resp.status_code}
-                        else:
-                            txt = resp.text[:200].replace("\n", " ")
-                            print(f"[uazapi] {endpoint} {resp.status_code} body={txt}")
-                    except Exception as exc:
-                        print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
-            raise RuntimeError(f"Uazapi media send failed for phone={phone}")
+            for payload in candidates:
+                try:
+                    resp = await client.post(endpoint, json=payload, headers=headers)
+                    if resp.status_code < 400:
+                        print(f"[uazapi][media] OK {endpoint} payload_keys={list(payload.keys())}")
+                        try:
+                            return resp.json()
+                        except Exception:
+                            return {"status": "ok", "http_status": resp.status_code}
+                    else:
+                        print(f"[uazapi][media] {endpoint} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                except Exception as exc:
+                    print(f"[uazapi][media] EXC {endpoint} payload={list(payload.keys())}: {exc}")
+        raise RuntimeError(f"Uazapi media send failed for phone={phone}")
 
 async def send_menu_interesse(
     *,
@@ -221,52 +202,79 @@ async def send_menu_interesse(
     footer_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Envia caixinha (menu de botões) usando o endpoint /send/menu.
+    Envia caixinha (menu/botões) tentando múltiplos formatos/rotas:
+      - choices: [yes, no]
+      - buttons: [{"text":...}, ...]  ou  [{"buttonText":...}, ...]
+      - options: [yes, no]
+      - number | phone | chatId
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
     headers = _headers()
     digits = _only_digits(phone) or phone
 
-    payloads = [
-        {
-            "number": digits,
-            "type": "button",
-            "text": text,
-            "choices": [yes_label, no_label],
-            **({"footerText": footer_text} if footer_text else {}),
-        },
-        {
-            "phone": digits,
-            "type": "button",
-            "text": text,
-            "choices": [yes_label, no_label],
-            **({"footerText": footer_text} if footer_text else {}),
-        },
+    def _common(base: Dict[str, Any]) -> Dict[str, Any]:
+        if footer_text:
+            base["footerText"] = footer_text
+        return base
+
+    payload_variants: List[Dict[str, Any]] = []
+
+    # 1) formato observado no seu n8n (choices)  
+    payload_variants += [
+        _common({"number": digits, "type": "button", "text": text, "choices": [yes_label, no_label]}),
+        _common({"phone":  digits, "type": "button", "text": text, "choices": [yes_label, no_label]}),
     ]
 
-    endpoint = _ensure_leading_slash(UAZAPI_SEND_MENU_PATH or "/send/menu")
+    # 2) variações com "buttons" e "buttonText"
+    buttons_simple = [{"text": yes_label}, {"text": no_label}]
+    buttons_bt     = [{"buttonText": yes_label}, {"buttonText": no_label}]
+    for id_field in ("number", "phone"):
+        payload_variants += [
+            _common({id_field: digits, "type": "button", "text": text, "buttons": buttons_simple}),
+            _common({id_field: digits, "type": "button", "text": text, "buttons": buttons_bt}),
+        ]
+
+    # 3) usando chatId
+    for cid in _chatid_variants(digits):
+        payload_variants += [
+            _common({"chatId": cid, "type": "button", "text": text, "choices": [yes_label, no_label]}),
+            _common({"chatId": cid, "type": "button", "text": text, "buttons": buttons_simple}),
+            _common({"chatId": cid, "type": "button", "text": text, "buttons": buttons_bt}),
+        ]
+
+    # 4) alguns aceitam "options"
+    payload_variants += [
+        _common({"number": digits, "type": "button", "text": text, "options": [yes_label, no_label]}),
+        _common({"phone":  digits, "type": "button", "text": text, "options": [yes_label, no_label]}),
+    ]
+
+    endpoints = _menu_endpoints()
+
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
-        for payload in payloads:
-            try:
-                resp = await client.post(endpoint, json=payload, headers=headers)
-                if resp.status_code < 400:
-                    try:
-                        return resp.json()
-                    except Exception:
-                        return {"status": "ok", "http_status": resp.status_code}
-                print(f"[uazapi] {endpoint} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
-            except Exception as exc:
-                print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
+        for endpoint in endpoints:
+            for payload in payload_variants:
+                try:
+                    resp = await client.post(endpoint, json=payload, headers=headers)
+                    if resp.status_code < 400:
+                        print(f"[uazapi][menu] OK {endpoint} payload_keys={list(payload.keys())}")
+                        try:
+                            return resp.json()
+                        except Exception:
+                            return {"status": "ok", "http_status": resp.status_code}
+                    else:
+                        print(f"[uazapi][menu] {endpoint} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                except Exception as exc:
+                    print(f"[uazapi][menu] EXC {endpoint} payload={list(payload.keys())}: {exc}")
+
+    # Degrada com texto se tudo falhar
+    print("[uazapi][menu] todos os formatos/rotas falharam; enviando texto de fallback.")
+    await send_whatsapp_message(phone=digits, content=f"{text}\n\n1) {yes_label}\n2) {no_label}", type_="text")
     raise RuntimeError("Uazapi menu send failed")
 
-# Alias de retrocompatibilidade
+# Alias antigo
 async def send_message(
-    *,
-    phone: str,
-    text: str,
-    media_url: Optional[str] = None,
-    mime_type: Optional[str] = None,
+    *, phone: str, text: str, media_url: Optional[str] = None, mime_type: Optional[str] = None
 ) -> Dict[str, Any]:
     if media_url:
         return await send_whatsapp_message(
@@ -290,7 +298,6 @@ async def upload_file_to_baserow(media_url: str) -> Optional[dict]:
             filename = media_url.split("/")[-1].split("?")[0] or "file"
             files = {"file": (filename, file_bytes)}
             headers = {"Authorization": f"Token {BASEROW_API_TOKEN}"}
-
             for url in (
                 f"{BASEROW_BASE_URL}/api/user-files/upload-file/",
                 f"{BASEROW_BASE_URL}/api/userfiles/upload_file/",
