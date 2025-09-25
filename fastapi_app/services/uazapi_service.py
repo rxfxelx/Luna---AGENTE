@@ -32,7 +32,7 @@ UAZAPI_SEND_MENU_PATH = os.getenv("UAZAPI_SEND_MENU_PATH", "/send/menu")
 # Fallbacks comuns observados em instalações diferentes
 _TEXT_FALLBACKS = ["/send/message", "/api/sendText", "/sendText", "/messages/send", "/message/send"]
 _MEDIA_FALLBACKS = ["/send/file", "/api/sendFile", "/api/sendMedia", "/sendMedia"]
-_MENU_FALLBACKS = ["/send/menu", "/api/sendMenu", "/send/button", "/send/buttons"]
+_MENU_FALLBACKS  = ["/send/menu", "/api/sendMenu", "/send/button", "/send/buttons"]
 
 # -------------------- Helpers --------------------
 def _ensure_leading_slash(path: str) -> str:
@@ -68,7 +68,7 @@ def _headers_json() -> Dict[str, str]:
     elif UAZAPI_AUTH_HEADER_NAME in {"authorization_bearer", "authorization", "bearer"}:
         base["Authorization"] = f"Bearer {UAZAPI_TOKEN}"
     else:
-        base["token"] = UAZAPI_TOKEN  # fallback seguro
+        base["token"] = UAZAPI_TOKEN
     return base
 
 def _headers_form() -> Dict[str, str]:
@@ -77,7 +77,7 @@ def _headers_form() -> Dict[str, str]:
     return h
 
 def _chatid_variants(phone: str) -> Iterable[str]:
-    """Gera variantes: <digits>@c.us, <digits>@s.whatsapp.net, <digits>."""
+    """<digits>@c.us, <digits>@s.whatsapp.net, <digits>."""
     digits = _only_digits(phone) or phone
     seen = set()
     for v in (f"{digits}@c.us", f"{digits}@s.whatsapp.net", digits):
@@ -104,7 +104,6 @@ def _infer_mime_from_url(url: str) -> str:
     return "application/octet-stream"
 
 def _text_endpoints() -> list[str]:
-    # Ordem: env → padrão → fallbacks
     candidates = [UAZAPI_SEND_TEXT_PATH, "/send/text"] + _TEXT_FALLBACKS
     return _dedup(candidates)
 
@@ -119,7 +118,7 @@ def _menu_endpoints() -> list[str]:
 async def _try_post(
     client: httpx.AsyncClient, endpoint: str, payload_json: Dict[str, Any], payload_form: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """Tenta JSON e depois FORM no mesmo endpoint."""
+    """Tenta JSON e, se falhar, FORM urlencoded no mesmo endpoint."""
     try:
         resp = await client.post(endpoint, json=payload_json, headers=_headers_json())
         if resp.status_code < 400:
@@ -132,7 +131,6 @@ async def _try_post(
     except Exception as exc:
         print(f"[uazapi] exception JSON {endpoint}: {exc}")
 
-    # fallback: form urlencoded
     try:
         resp = await client.post(endpoint, data=payload_form, headers=_headers_form())
         if resp.status_code < 400:
@@ -168,22 +166,20 @@ async def send_whatsapp_message(
     digits = _only_digits(phone) or phone
 
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
-        # ---------------- TEXT ----------------
+        # TEXT
         if type_ == "text" or not media_url:
             for endpoint in _text_endpoints():
                 json_payloads = [
                     {"number": digits, "text": content},
                     {"phone": digits, "text": content},
                 ] + [{"chatId": cid, "text": content} for cid in _chatid_variants(digits)]
-
                 for p in json_payloads:
                     got = await _try_post(client, endpoint, p, p)
                     if got is not None:
                         return got
-
             raise RuntimeError(f"Uazapi text send failed for phone={phone}")
 
-        # ---------------- MEDIA ----------------
+        # MEDIA
         mime = mime_type or _infer_mime_from_url(media_url)
         for endpoint in _media_endpoints():
             payloads: Tuple[Dict[str, Any], ...] = (
@@ -194,12 +190,10 @@ async def send_whatsapp_message(
                 {"number": digits, "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
                 {"chatId": f"{digits}@c.us", "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
             )
-
             for p in payloads:
                 got = await _try_post(client, endpoint, p, p)
                 if got is not None:
                     return got
-
         raise RuntimeError(f"Uazapi media send failed for phone={phone}")
 
 async def send_menu_interesse(
@@ -211,17 +205,13 @@ async def send_menu_interesse(
     footer_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Envia caixinha (botões) usando /send/menu com múltiplos formatos:
-      - {"number","type":"button","text","choices":[...],"footerText"}
-      - {"number","type":"button","text","buttons":[{"id","title"},...]}
-      - {"number","text","button1Label","button2Label"}
+    Envia caixinha (botões) com múltiplos formatos/rotas para cobrir variações do Uazapi.
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
 
     digits = _only_digits(phone) or phone
 
-    # JSON e FORM: variações
     json_variants = [
         {
             "number": digits,
@@ -241,23 +231,11 @@ async def send_menu_interesse(
             **({"footerText": footer_text} if footer_text else {}),
         },
         # Fallback antigo
-        {
-            "number": digits,
-            "text": text,
-            "button1Label": yes_label,
-            "button2Label": no_label,
-        },
-        # Variação "phone"
-        {
-            "phone": digits,
-            "type": "button",
-            "text": text,
-            "choices": [yes_label, no_label],
-            **({"footerText": footer_text} if footer_text else {}),
-        },
+        {"number": digits, "text": text, "button1Label": yes_label, "button2Label": no_label},
+        # variação "phone"
+        {"phone": digits, "type": "button", "text": text, "choices": [yes_label, no_label], **({"footerText": footer_text} if footer_text else {})},
     ]
-
-    form_variants = json_variants  # os mesmos payloads servem como form
+    form_variants = json_variants
 
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
         for endpoint in _menu_endpoints():
@@ -298,7 +276,6 @@ async def upload_file_to_baserow(media_url: str) -> Optional[dict]:
             filename = media_url.split("/")[-1].split("?")[0] or "file"
             files = {"file": (filename, file_bytes)}
             headers = {"Authorization": f"Token {BASEROW_API_TOKEN}"}
-
             for url in (
                 f"{BASEROW_BASE_URL}/api/user-files/upload-file/",
                 f"{BASEROW_BASE_URL}/api/userfiles/upload_file/",
