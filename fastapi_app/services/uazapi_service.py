@@ -104,7 +104,6 @@ def _infer_mime_from_url(url: str) -> str:
     return "application/octet-stream"
 
 def _text_endpoints() -> list[str]:
-    # Ordem: env → padrão → fallbacks
     candidates = [UAZAPI_SEND_TEXT_PATH, "/send/text"] + _TEXT_FALLBACKS
     return _dedup(candidates)
 
@@ -132,7 +131,6 @@ async def _try_post(
     except Exception as exc:
         print(f"[uazapi] exception JSON {endpoint}: {exc}")
 
-    # fallback: form urlencoded
     try:
         resp = await client.post(endpoint, data=payload_form, headers=_headers_form())
         if resp.status_code < 400:
@@ -215,6 +213,7 @@ async def send_menu_interesse(
       - {"number","type":"button","text","choices":[...],"footerText"}
       - {"number","type":"button","text","buttons":[{"id","title"},...]}
       - {"number","text","button1Label","button2Label"}
+      - variações com alias "message"/"footer" e "phone".
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
@@ -241,20 +240,14 @@ async def send_menu_interesse(
             **({"footerText": footer_text} if footer_text else {}),
         },
         # Fallback antigo
-        {
-            "number": digits,
-            "text": text,
-            "button1Label": yes_label,
-            "button2Label": no_label,
-        },
+        {"number": digits, "text": text, "button1Label": yes_label, "button2Label": no_label},
+        # Aliases
+        {"number": digits, "message": text, "button1Label": yes_label, "button2Label": no_label},
+        {"number": digits, "type": "button", "message": text, "choices": [yes_label, no_label],
+         **({"footer": footer_text} if footer_text else {})},
         # Variação "phone"
-        {
-            "phone": digits,
-            "type": "button",
-            "text": text,
-            "choices": [yes_label, no_label],
-            **({"footerText": footer_text} if footer_text else {}),
-        },
+        {"phone": digits, "type": "button", "text": text, "choices": [yes_label, no_label],
+         **({"footerText": footer_text} if footer_text else {})},
     ]
 
     form_variants = json_variants  # os mesmos payloads servem como form
@@ -298,7 +291,6 @@ async def upload_file_to_baserow(media_url: str) -> Optional[dict]:
             filename = media_url.split("/")[-1].split("?")[0] or "file"
             files = {"file": (filename, file_bytes)}
             headers = {"Authorization": f"Token {BASEROW_API_TOKEN}"}
-
             for url in (
                 f"{BASEROW_BASE_URL}/api/user-files/upload-file/",
                 f"{BASEROW_BASE_URL}/api/userfiles/upload_file/",
