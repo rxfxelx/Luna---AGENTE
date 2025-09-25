@@ -7,10 +7,7 @@ Expõe:
 - send_menu_interesse(phone, text, yes_label, no_label, footer_text=None)
 - send_message(...) -> alias compatível (usa send_whatsapp_message)
 - upload_file_to_baserow(media_url) -> Optional[dict]
-
-Compat de legados (importações antigas em outros módulos):
-- normalize_number(phone) -> só dígitos (E.164 sem '+')
-- normalize_chatid(phone) -> '<digits>@c.us'
+- normalize_number(phone) -> compatibilidade com versões antigas
 """
 
 from __future__ import annotations
@@ -34,7 +31,7 @@ UAZAPI_SEND_MENU_PATH = os.getenv("UAZAPI_SEND_MENU_PATH", "/send/menu")
 
 # Fallbacks comuns observados em instalações diferentes
 _TEXT_FALLBACKS = ["/send/message", "/api/sendText", "/sendText", "/messages/send", "/message/send"]
-_MEDIA_FALLBACKS = ["/send/file", "/api/sendFile", "/api/sendMedia", "/messages/sendMedia"]
+_MEDIA_FALLBACKS = ["/send/file", "/api/sendFile", "/api/sendMedia"]
 
 # -------------------- Helpers --------------------
 def _ensure_leading_slash(path: str) -> str:
@@ -42,6 +39,13 @@ def _ensure_leading_slash(path: str) -> str:
 
 def _only_digits(s: str) -> str:
     return "".join(ch for ch in s if ch.isdigit())
+
+def normalize_number(phone: str) -> str:
+    """
+    Compatibilidade com serviços que importavam esta função.
+    Normaliza para somente dígitos (mantém DDI/DDD se existirem).
+    """
+    return _only_digits(phone)
 
 def _dedup(seq: Iterable[str]) -> list[str]:
     out: list[str] = []
@@ -105,19 +109,6 @@ def _infer_mime_from_url(url: str) -> str:
         return "audio/ogg"
     return "application/octet-stream"
 
-def _type_from_mime(mime: str) -> str:
-    """Mapeia mime para 'type' aceito por algumas instalações da Uazapi."""
-    m = (mime or "").lower()
-    if m.startswith("image/"):
-        return "image"
-    if m.startswith("video/"):
-        return "video"
-    if m.startswith("audio/"):
-        return "audio"
-    if m == "application/pdf":
-        return "document"
-    return "document"
-
 def _text_endpoints() -> list[str]:
     """
     Ordem garantida: '/send/text' SEMPRE primeiro, depois env e fallbacks.
@@ -126,8 +117,7 @@ def _text_endpoints() -> list[str]:
     return _dedup(candidates)
 
 def _media_endpoints() -> list[str]:
-    # Damos prioridade ao caminho canônico '/send/media'
-    candidates = ["/send/media", UAZAPI_SEND_MEDIA_PATH] + _MEDIA_FALLBACKS
+    candidates = [UAZAPI_SEND_MEDIA_PATH, "/send/media"] + _MEDIA_FALLBACKS
     return _dedup(candidates)
 
 # -------------------- Senders --------------------
@@ -143,7 +133,7 @@ async def send_whatsapp_message(
     """
     Envia mensagem via Uazapi com múltiplas tentativas (endpoints/payloads).
     - Para '/send/text': prioriza {"number": "<digits>", "text": content}.
-    - Para '/send/media': tenta *várias* formas: 'file', 'url', 'fileUrl', com e sem 'type'.
+    - Para '/send/media': prioriza {"number": "<digits>", "url": media_url, "caption": ...}.
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
@@ -157,7 +147,7 @@ async def send_whatsapp_message(
                 # Se for '/send/text', o formato preferido é number+text
                 if endpoint == "/send/text":
                     candidates = [
-                        {"number": digits, "text": content},                  # preferido (v2)
+                        {"number": digits, "text": content},                  # formato preferido (v2)
                         {"phone": digits, "text": content},                   # variação
                         {"chatId": f"{digits}@c.us", "text": content},        # fallback
                     ]
@@ -186,25 +176,18 @@ async def send_whatsapp_message(
 
         else:
             mime = mime_type or _infer_mime_from_url(media_url)
-            utype = _type_from_mime(mime)
             for endpoint in _media_endpoints():
-                # Conjunto abrangente de payloads (observado no seu n8n: 'file' + 'type')
-                # Tentamos da forma mais comum para a menos comum.
                 if endpoint == "/send/media":
                     candidates = [
-                        {"number": digits, "file": media_url, "type": utype, "caption": caption or content},
-                        {"phone": digits,  "file": media_url, "type": utype, "caption": caption or content},
-                        {"number": digits, "url": media_url,               "caption": caption or content},
-                        {"phone": digits,  "url": media_url,               "caption": caption or content},
-                        {"chatId": f"{digits}@c.us", "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
+                        {"number": digits, "url": media_url, "caption": caption or content},     # preferido
+                        {"phone": digits, "url": media_url, "caption": caption or content},      # variação
+                        {"chatId": f"{digits}@c.us", "fileUrl": media_url, "mimeType": mime, "caption": caption or content},  # fallback
                     ]
                 else:
                     candidates = [
-                        {"number": digits, "file": media_url, "type": utype, "caption": caption or content},
-                        {"phone": digits,  "file": media_url, "type": utype, "caption": caption or content},
-                        {"number": digits, "url": media_url,               "caption": caption or content},
-                        {"phone": digits,  "url": media_url,               "caption": caption or content},
                         {"chatId": f"{digits}@c.us", "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
+                        {"phone": digits, "url": media_url, "caption": caption or content},
+                        {"number": digits, "url": media_url, "caption": caption or content},
                     ]
 
                 for payload in candidates:
@@ -315,18 +298,3 @@ async def upload_file_to_baserow(media_url: str) -> Optional[dict]:
         except Exception as exc:
             print(f"Erro ao baixar/enviar arquivo p/ Baserow: {exc}")
             return None
-
-# -------------------- Compatibilidade (legados) --------------------
-def normalize_number(phone: str) -> str:
-    """
-    Compat: retorna apenas dígitos do número.
-    Usado por módulos antigos (ex.: openai_service).
-    """
-    return _only_digits(phone or "")
-
-def normalize_chatid(phone: str) -> str:
-    """
-    Compat: retorna '<digits>@c.us' a partir do número informado.
-    """
-    digits = _only_digits(phone or "")
-    return f"{digits}@c.us" if digits else ""
