@@ -6,12 +6,6 @@ Fluxo chave desta versão:
 - Caixinha e Vídeo têm helpers explícitos e são registrados no histórico
   com media_type = "menu" / "video", para podermos detectar o "estado"
   via banco (última interação do assistente).
-
-Ajustes desta revisão:
-- Detecta "convite do Passo 3" no texto da IA (ex.: "posso te mostrar", "quer ver um exemplo",
-  "te mostro em 30s", "posso enviar?") e envia automaticamente a CAIXINHA após o texto.
-- Se o usuário responder "sim" logo após um "convite do Passo 3" (mesmo sem menu registrado),
-  envia o VÍDEO imediatamente (evita travar o fluxo).
 """
 
 from __future__ import annotations
@@ -284,35 +278,70 @@ _POSITIVE_WORDS = {
 }
 _POSITIVE_EMOJIS = {"👍", "👌", "✅", "✔️", "✌️", "🤝"}
 
-async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
+async def _last_assistant_message(session: AsyncSession, user_id: int) -> Optional[Message]:
+    """
+    Retorna a ÚLTIMA mensagem do assistente para o usuário.
+    """
     try:
         q = (
             select(Message)
-            .where(Message.user_id == user_id, Message.sender == "assistant", Message.media_type == "menu")
+            .where(Message.user_id == user_id, Message.sender == "assistant")
+            .order_by(desc(Message.created_at))
+            .limit(1)
+        )
+        res = await session.execute(q)
+        return res.scalar_one_or_none()
+    except Exception as exc:
+        print(f"[state] erro ao consultar última msg do assistente: {exc!r}")
+        return None
+
+async def _is_last_assistant_menu_recent(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
+    """
+    True somente se a ÚLTIMA mensagem do assistente for um MENU enviado
+    dentro da janela de 'minutes'. Isso impede reenvio de vídeo em novos "sim".
+    """
+    last = await _last_assistant_message(session, user_id)
+    if not last or last.media_type != "menu" or not getattr(last, "created_at", None):
+        return False
+    # created_at é naive (UTC). Compare com utcnow naive.
+    now = datetime.utcnow()
+    last_at = last.created_at
+    if getattr(last_at, "tzinfo", None) is not None:
+        last_at = last_at.replace(tzinfo=None)
+    return (now - last_at) <= timedelta(minutes=minutes)
+
+async def _assistant_sent_video_recent(session: AsyncSession, user_id: int, seconds: int = 120) -> bool:
+    """
+    Anti-dúvida extra: evita duplicar vídeo se acabamos de enviar um vídeo
+    (protege contra repetição por latência ou múltiplos "sim" em sequência).
+    """
+    try:
+        q = (
+            select(Message)
+            .where(Message.user_id == user_id, Message.sender == "assistant")
             .order_by(desc(Message.created_at))
             .limit(1)
         )
         res = await session.execute(q)
         last = res.scalar_one_or_none()
-        if not last or not getattr(last, "created_at", None):
+        if not last or last.media_type != "video" or not getattr(last, "created_at", None):
             return False
-        # created_at é naive (UTC). Compare com utcnow naive.
         now = datetime.utcnow()
         last_at = last.created_at
         if getattr(last_at, "tzinfo", None) is not None:
             last_at = last_at.replace(tzinfo=None)
-        return (now - last_at) <= timedelta(minutes=minutes)
+        return (now - last_at) <= timedelta(seconds=seconds)
     except Exception as exc:
-        print(f"[state] erro ao consultar menu recente: {exc!r}")
+        print(f"[state] erro ao checar video recente: {exc!r}")
         return False
 
 def _is_positive_reply(text: Optional[str]) -> bool:
     if not text:
         return False
     t = _normalize(text)
-    if t in {_normalize(LUNA_MENU_YES), "sim"}:
+    if t in { _normalize(LUNA_MENU_YES), "sim" }:
         return True
-    if any(e in (text or "") for e in _POSITIVE_EMOJIS):
+    if any(e in text for e in _POSITIVE_EMOJIS):
         return True
     if t in _POSITIVE_WORDS:
         return True
@@ -322,30 +351,6 @@ def _is_positive_reply(text: Optional[str]) -> bool:
     if "video" in t or "vídeo" in t:
         return True
     return False
-
-def _looks_like_step3_invite(text: Optional[str]) -> bool:
-    """
-    Detecta mensagens típicas do Passo 3 (convite para enviar exemplo/case/vídeo curto).
-    Exemplos: "posso te mostrar", "quer ver um exemplo", "posso apresentar um case",
-    "te mostro em 30s", "quer ver em 30 segundos", "posso enviar?".
-    """
-    if not text:
-        return False
-    t = _normalize(text)
-    patterns = [
-        "posso te mostrar",
-        "quer ver um exemplo",
-        "posso apresentar um case",
-        "te mostro em 30",
-        "quer ver em 30",
-        "30s",
-        "30 segundos",
-        "posso enviar",
-        "posso apresentar",
-        "te mostro",
-        "case curto",
-    ]
-    return any(p in t for p in patterns)
 
 async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
     if not LUNA_MENU_TEXT:
@@ -369,6 +374,7 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
         await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
         return
     try:
+        # Envia mídia
         await send_whatsapp_message(
             phone=phone,
             content=LUNA_VIDEO_CAPTION or "",
@@ -378,6 +384,7 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
         )
         session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_URL, media_type="video"))
         await session.commit()
+        # Mensagem de follow-up
         if LUNA_VIDEO_AFTER_TEXT:
             await send_whatsapp_message(phone=phone, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
             session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_AFTER_TEXT, media_type="text"))
@@ -428,31 +435,28 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.commit()
                 await session.refresh(user)
 
-            # 0) Carrega última mensagem do assistente (quando necessário)
-            async def _last_assistant_text(u: User) -> str:
+            # 0) Anti-duplicação trivial: se acabamos de enviar VÍDEO, não repetir em "sims" em sequência
+            if await _assistant_sent_video_recent(session, user.id, seconds=120):
+                # segue para IA normalmente (permitindo que a conversa avance)
+                pass
+
+            # 1) Guard-rail: POSITIVO e ÚLTIMO do assistente foi MENU recentemente -> envia VÍDEO uma única vez
+            if msg_type == "text" and _is_positive_reply(text) and await _is_last_assistant_menu_recent(session, user.id, minutes=30):
+                await _enviar_video(session, phone, user)
+                return
+
+            # 1.5) Fallback determinístico para CAIXINHA logo após Passo 2 (pergunta de setor)
+            if msg_type == "text" and _is_positive_reply(text) and not await _is_last_assistant_menu_recent(session, user.id, minutes=30):
+                # olha a última resposta do assistente
                 q = (
                     select(Message)
-                    .where(Message.user_id == u.id, Message.sender == "assistant")
+                    .where(Message.user_id == user.id, Message.sender == "assistant")
                     .order_by(desc(Message.created_at))
                     .limit(1)
                 )
                 r = await session.execute(q)
-                la = r.scalar_one_or_none()
-                return (la.content or "") if la else ""
-
-            # 1) Guard-rail: se resposta POSITIVA após caixinha -> envia VÍDEO e encerra
-            if msg_type == "text" and _is_positive_reply(text) and await _has_recent_menu(session, user.id, minutes=30):
-                await _enviar_video(session, phone, user)
-                return
-
-            # 1.1) Novo: se resposta POSITIVA logo após um convite explícito do Passo 3 -> envia VÍDEO (mesmo sem menu)
-            if msg_type == "text" and _is_positive_reply(text) and not await _has_recent_menu(session, user.id, minutes=30):
-                last_text = _normalize(await _last_assistant_text(user))
-                if _looks_like_step3_invite(last_text) or last_text == _normalize(LUNA_MENU_TEXT):
-                    await _enviar_video(session, phone, user)
-                    return
-
-                # 1.5) Fallback determinístico para caixinha logo após Passo 2 (pergunta de setor)
+                last_assistant = r.scalar_one_or_none()
+                last_text = (last_assistant.content or "") if last_assistant else ""
                 step2_hints = [
                     "responsavel pelo marketing",
                     "parte de marketing/comunicacao",
@@ -460,7 +464,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     "divulgacao e video",
                     "acoes de marketing",
                 ]
-                if any(h in last_text for h in step2_hints):
+                if any(h in _normalize(last_text) for h in step2_hints):
                     await _enviar_menu(session, phone, user)
                     return
 
@@ -472,14 +476,15 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     reply_text = "Desculpe, não consegui processar sua mensagem agora."
 
                 send_menu_hint, send_video_hint = _parse_tool_hints(reply_text)
-                step3_invite = _looks_like_step3_invite(reply_text)
 
-                # 2.1) Se a IA sinalizou vídeo de forma explícita -> envia vídeo e encerra
-                if send_video_hint:
+                if send_menu_hint:
+                    await _enviar_menu(session, phone, user)
+                    return
+
+                if send_video_hint and not await _assistant_sent_video_recent(session, user.id, seconds=120):
                     await _enviar_video(session, phone, user)
                     return
 
-                # 2.2) Envia a resposta textual
                 try:
                     await send_whatsapp_message(phone=phone, content=reply_text, type_="text")
                 except Exception as e:
@@ -488,14 +493,9 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 out_msg = Message(user_id=user.id, sender="assistant", content=reply_text, media_type="text")
                 session.add(out_msg)
                 await session.commit()
-
-                # 2.3) Se a resposta textual foi um "convite Passo 3", já disparamos a CAIXINHA
-                if step3_invite or send_menu_hint:
-                    await _enviar_menu(session, phone, user)
-
                 return
 
-            # 3) Mensagens não-texto (áudio/imagem etc.)
+            # Mensagens não-texto (áudio/imagem etc.)
             ack = "Arquivo recebido com sucesso. Já estou processando! ✅"
             try:
                 await send_whatsapp_message(phone=phone, content=ack, type_="text")
