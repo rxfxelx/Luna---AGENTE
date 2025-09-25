@@ -54,8 +54,9 @@ LUNA_STRICT_ASSISTANT = _env_str("LUNA_STRICT_ASSISTANT", "false").lower() == "t
 HANDOFF_NOTIFY_NUMBERS   = _env_str("HANDOFF_NOTIFY_NUMBERS", "")   # ex.: "5531999999999, 5531988888888"
 HANDOFF_NOTIFY_TEMPLATE  = _env_str(
     "HANDOFF_NOTIFY_TEMPLATE",
+    # sem "Última mensagem", conforme sua preferência
     "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
-    "Nome: {name}\nTelefone: +{digits}\nÚltima mensagem: {last}\nOrigem: WhatsApp"
+    "Nome: {name}\nTelefone: +{digits}\nOrigem: WhatsApp"
 )
 
 # --------------------------- Auth helpers ---------------------------
@@ -389,13 +390,9 @@ def _build_handoff_text(user: User, phone: str, last_msg: Optional[str]) -> str:
     name = (user.name or "—").strip()
     last = (last_msg or "—").strip()
     try:
-        return HANDOFF_NOTIFY_TEMPLATE.format(name=name, digits=digits, last=last)
+        return HANDOFF_NOTIFY_TEMPLATE.format(name=name, digits=digits)
     except Exception:
-        # fallback seguro se template estiver inválido
-        return (
-            "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
-            f"Nome: {name}\nTelefone: +{digits}\nÚltima mensagem: {last}\nOrigem: WhatsApp"
-        )
+        return f"Novo lead aguardando contato (Luna — Verbo Vídeo)\nNome: {name}\nTelefone: +{digits}\nOrigem: WhatsApp"
 
 async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, user_text: Optional[str]) -> None:
     targets = _parse_notify_numbers(HANDOFF_NOTIFY_NUMBERS)
@@ -420,10 +417,10 @@ def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool, bool]:
     wants_handoff = "enviar_msg" in t or _looks_like_handoff(reply_text)
     return (wants_menu, wants_video, wants_handoff)
 
-# --------------------------- AÇÕES (reintroduzidas) ---------------------------
+# --------------------------- AÇÕES (helpers) ---------------------------
 
 async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
-    """Envia a caixinha de interesse e registra estado 'menu' no histórico."""
+    """Envia a caixinha de interesse e registra estado; fallback para texto."""
     if not LUNA_MENU_TEXT:
         print("[menu] LUNA_MENU_TEXT não definido; caixinha foi pulada.")
         return
@@ -440,9 +437,17 @@ async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
         print("[menu] enviado com sucesso.")
     except Exception as exc:
         print(f"[menu] falha ao enviar menu: {exc!r}")
+        # fallback texto simples (a conversa não fica travada)
+        try:
+            fallback = f"{LUNA_MENU_TEXT}\n\n[{LUNA_MENU_YES}]  |  [{LUNA_MENU_NO}]"
+            await send_whatsapp_message(phone=phone, content=fallback, type_="text")
+            session.add(Message(user_id=user.id, sender="assistant", content=fallback, media_type="text"))
+            await session.commit()
+        except Exception as exc2:
+            print(f"[menu] fallback text failed: {exc2!r}")
 
 async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
-    """Envia o vídeo demonstrativo e registra estado 'video'."""
+    """Envia o vídeo (ou qualquer mídia da env) e registra estado; envia frase pós‑vídeo."""
     if not LUNA_VIDEO_URL:
         await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
         return
@@ -528,8 +533,8 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.refresh(user)
 
             # Estado
-            menu_recent   = await _has_recent_menu(session, user.id, minutes=30)
-            video_recent  = await _has_recent_video(session, user.id, minutes=30)
+            menu_recent    = await _has_recent_menu(session, user.id, minutes=30)
+            video_recent   = await _has_recent_video(session, user.id, minutes=30)
             handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)
 
             # 1) Texto -> consulta IA (sempre), com CONTEXTO do estado
