@@ -2,11 +2,12 @@
 """
 Webhook e endpoints para WhatsApp (Uazapi).
 
-Fluxo:
-- Se o usuário responder POSITIVO após a caixinha -> envia o VÍDEO diretamente.
-- Se a IA "sugerir" caixinha (tool-hint ou texto convite) -> envia somente a CAIXINHA.
-- Anti-duplicação: se acabou de enviar caixinha, não envia texto "convite".
-- NOVO: após VÍDEO, qualquer resposta vai para a IA com contexto, e o vídeo não é reenviado.
+Fluxo resumido:
+- Sempre encaminha a mensagem do usuário para a IA (Assistant), com contexto do estado (caixinha/vídeo).
+- Envia CAIXINHA/VÍDEO somente quando a IA solicitar (tool-hints). Opcionalmente há fallback:
+  - Se lead disse "SIM" à caixinha e ainda não houve VÍDEO recente, envia vídeo (pode desativar via LUNA_STRICT_ASSISTANT).
+- Deduplicação de webhooks: ignora POST duplicado (mesmo texto/tipo em ≤5s).
+- Anti-duplicação de ações: não reenviar caixinha/vídeo se já houve envio recente.
 """
 
 from __future__ import annotations
@@ -44,6 +45,9 @@ LUNA_VIDEO_URL        = _env_str("LUNA_VIDEO_URL", "")
 LUNA_VIDEO_CAPTION    = _env_str("LUNA_VIDEO_CAPTION", "")
 LUNA_VIDEO_AFTER_TEXT = _env_str("LUNA_VIDEO_AFTER_TEXT", "")
 LUNA_END_TEXT         = _env_str("LUNA_END_TEXT", "")
+
+# Se "true", NÃO usa fallback automático para vídeo após caixinha SIM (tudo 100% IA)
+LUNA_STRICT_ASSISTANT = _env_str("LUNA_STRICT_ASSISTANT", "false").lower() == "true"
 
 # --------------------------- Auth helpers ---------------------------
 
@@ -278,29 +282,7 @@ _POSITIVE_WORDS = {
 }
 _POSITIVE_EMOJIS = {"👍", "👌", "✅", "✔️", "✌️", "🤝"}
 
-async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
-    try:
-        q = (
-            select(Message)
-            .where(Message.user_id == user_id, Message.sender == "assistant", Message.media_type == "menu")
-            .order_by(desc(Message.created_at))
-            .limit(1)
-        )
-        res = await session.execute(q)
-        last = res.scalar_one_or_none()
-        if not last or not getattr(last, "created_at", None):
-            return False
-        now = datetime.utcnow()
-        last_at = last.created_at
-        if getattr(last_at, "tzinfo", None) is not None:
-            last_at = last_at.replace(tzinfo=None)
-        return (now - last_at) <= timedelta(minutes=minutes)
-    except Exception as exc:
-        print(f"[state] erro ao consultar menu recente: {exc!r}")
-        return False
-
-# NOVO: checagem genérica e de vídeo recente
-async def _has_recent(session: AsyncSession, user_id: int, media_type: str, minutes: int) -> bool:
+async def _has_recent_generic(session: AsyncSession, user_id: int, media_type: str, minutes: int) -> bool:
     try:
         q = (
             select(Message)
@@ -321,8 +303,11 @@ async def _has_recent(session: AsyncSession, user_id: int, media_type: str, minu
         print(f"[state] erro ao consultar {media_type} recente: {exc!r}")
         return False
 
+async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
+    return await _has_recent_generic(session, user_id, "menu", minutes)
+
 async def _has_recent_video(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
-    return await _has_recent(session, user_id, "video", minutes)
+    return await _has_recent_generic(session, user_id, "video", minutes)
 
 def _is_positive_reply(text: Optional[str]) -> bool:
     if not text:
@@ -340,7 +325,6 @@ def _is_positive_reply(text: Optional[str]) -> bool:
         return True
     return False
 
-# Detecção de convite mais robusta (30s / 30 s / 30 seg / 30 segundos ...)
 _INVITE_PATTERNS = (
     "quer ver em 30", "quer ver em 30s", "quer ver em 30 s",
     "30 seg", "30seg", "30 segundos", "trinta segundos",
@@ -404,6 +388,35 @@ def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool]:
     wants_video = "enviar_video" in t or ("enviar" in t and "vídeo" in t) or ("mandar" in t and "vídeo" in t)
     return (wants_menu, wants_video)
 
+# --------------------------- Deduplicação de inbound ---------------------------
+
+async def _is_probably_duplicate(db: AsyncSession, user_id: int, text: Optional[str], msg_type: str, window_seconds: int = 5) -> bool:
+    """Dedup simples: mesmo conteúdo+tipo do último inbound no intervalo definido."""
+    try:
+        q = (
+            select(Message)
+            .where(Message.user_id == user_id, Message.sender == "user")
+            .order_by(desc(Message.created_at))
+            .limit(1)
+        )
+        res = await db.execute(q)
+        last = res.scalar_one_or_none()
+        if not last:
+            return False
+        last_text = last.content or ""
+        now = datetime.utcnow()
+        last_at = last.created_at
+        if getattr(last_at, "tzinfo", None) is not None:
+            last_at = last_at.replace(tzinfo=None)
+        same_text = (last_text or "").strip() == (text or "").strip()
+        same_type = (last.media_type or "") == (msg_type or "")
+        recent = (now - last_at) <= timedelta(seconds=window_seconds)
+        return bool(same_text and same_type and recent)
+    except Exception as exc:
+        print(f"[dedup] erro na checagem de duplicidade: {exc!r}")
+        return False
+
+# ================== endpoints ('' e '/') para evitar 307 ==================
 @router.head("")
 @router.head("/")
 async def head_check(
@@ -438,20 +451,14 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.commit()
                 await session.refresh(user)
 
-            # Estado recente
+            # Estado
             menu_recent  = await _has_recent_menu(session, user.id, minutes=30)
             video_recent = await _has_recent_video(session, user.id, minutes=30)
 
-            # 0) Resposta POSITIVA + (caixinha recente e NENHUM vídeo recente) -> envia VÍDEO
-            if msg_type == "text" and _is_positive_reply(text) and menu_recent and not video_recent:
-                await _enviar_video(session, phone, user)
-                return
-
-            # 1) Texto -> consulta IA (mantendo seu fluxo)
+            # 1) Texto -> consulta IA (sempre), com CONTEXTO do estado
             if msg_type == "text" and text:
                 thread_id = await get_or_create_thread(session, user)
 
-                # Contexto para a IA sem alterar prompts/ENVs
                 prefix = ""
                 if video_recent:
                     prefix = (
@@ -459,36 +466,40 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         "Prossiga com a etapa seguinte do fluxo (pós-vídeo). Mensagem do lead: "
                     )
                 elif menu_recent:
-                    prefix = (
-                        "Contexto: foi enviada uma caixinha de interesse (botões) ao lead. "
-                        "Mensagem do lead: "
-                    )
+                    # Detectar intenção do texto
+                    tnorm = _normalize(text)
+                    if tnorm in {_normalize(LUNA_MENU_YES), "sim"} or "sim" in tnorm:
+                        prefix = "Contexto: o lead respondeu SIM na caixinha de interesse. Mensagem do lead: "
+                    elif tnorm in {_normalize(LUNA_MENU_NO), "nao", "não"} or "nao" in tnorm or "não" in tnorm:
+                        prefix = "Contexto: o lead respondeu NÃO na caixinha de interesse. Mensagem do lead: "
+                    else:
+                        prefix = "Contexto: foi enviada uma caixinha de interesse ao lead. Mensagem do lead: "
 
                 ai_input = (prefix + (text or "")).strip()
                 reply_text = await ask_assistant(thread_id, ai_input) or ""
 
                 send_menu_hint, send_video_hint = _parse_tool_hints(reply_text)
 
-                # 1.a) Se a IA pediu caixinha OU a resposta parece "convite" -> envia CAIXINHA (se ainda não houve)
+                # 1.a) Se a IA pediu caixinha/convite
                 if (send_menu_hint or _looks_like_invite(reply_text)) and not menu_recent:
                     await _enviar_menu(session, phone, user)
                     return
                 if (send_menu_hint or _looks_like_invite(reply_text)) and menu_recent:
                     print("[guard] IA/convite pediu caixinha, mas já existe recente; ignorando convite.")
 
-                # 1.b) Se a IA pediu VÍDEO explicitamente -> envia apenas se ainda não houver vídeo recente
+                # 1.b) Se a IA pediu VÍDEO -> envia se ainda não houver vídeo recente
                 if send_video_hint and not video_recent:
                     await _enviar_video(session, phone, user)
                     return
                 if send_video_hint and video_recent:
                     print("[guard] IA pediu vídeo, mas já enviamos recentemente; ignorando.")
 
-                # 1.c) Fallback: se usuário foi POSITIVO e ainda não teve caixinha recente -> envia CAIXINHA
-                if _is_positive_reply(text) and not menu_recent:
-                    await _enviar_menu(session, phone, user)
+                # 1.c) Fallback (opcional) — vídeo após caixinha SIM (se IA não mandou)
+                if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
+                    await _enviar_video(session, phone, user)
                     return
 
-                # 1.d) Se acabamos de enviar caixinha, evitamos ecoar um texto "convite"
+                # 1.d) Anti-eco (convite) após caixinha
                 if menu_recent and _looks_like_invite(reply_text):
                     print("[guard] menu enviado há pouco; suprimindo texto convite duplicado.")
                     return
@@ -504,7 +515,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.commit()
                 return
 
-            # 2) Mensagens não-texto (áudio/imagem etc.)
+            # 2) Mensagens não-texto
             ack = "Arquivo recebido com sucesso. Já estou processando! ✅"
             try:
                 await send_whatsapp_message(phone=phone, content=ack, type_="text")
@@ -548,6 +559,7 @@ async def webhook_post(
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
 
+    # Garante que o usuário exista
     res = await db.execute(select(User).where(User.phone == phone))
     user = res.scalar_one_or_none()
     if not user:
@@ -556,6 +568,12 @@ async def webhook_post(
         await db.commit()
         await db.refresh(user)
 
+    # ------ DEDUP INBOUND ------
+    if await _is_probably_duplicate(db, user.id, text if msg_type == "text" else None, msg_type, window_seconds=5):
+        print("[dedup] inbound duplicado detectado; ignorando processamento.")
+        return JSONResponse({"received": True, "note": "duplicate_dropped"}, status_code=200)
+
+    # Persiste inbound
     in_msg = Message(
         user_id=user.id,
         sender="user",
