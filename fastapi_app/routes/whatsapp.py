@@ -5,7 +5,7 @@ Webhook e endpoints para WhatsApp (Uazapi).
 Fluxo:
 - Se o usuário responder POSITIVO após a caixinha -> envia o VÍDEO diretamente.
 - Se a IA "sugerir" caixinha (tool-hint ou texto convite) -> envia somente a CAIXINHA.
-- Anti-duplicação simples: se acabou de enviar caixinha, não envia texto "convite".
+- Anti-duplicação: se acabou de enviar caixinha, não envia texto "convite".
 """
 
 from __future__ import annotations
@@ -29,8 +29,6 @@ from ..services.uazapi_service import send_whatsapp_message, send_menu_interesse
 
 router = APIRouter(tags=["whatsapp-webhook"])
 
-# --------------------------- ENV (Luna) ---------------------------
-
 def _env_str(key: str, default: str = "") -> str:
     return (os.getenv(key, default) or "").strip().strip('"').strip("'")
 
@@ -43,8 +41,6 @@ LUNA_VIDEO_URL        = _env_str("LUNA_VIDEO_URL", "")
 LUNA_VIDEO_CAPTION    = _env_str("LUNA_VIDEO_CAPTION", "")
 LUNA_VIDEO_AFTER_TEXT = _env_str("LUNA_VIDEO_AFTER_TEXT", "")
 LUNA_END_TEXT         = _env_str("LUNA_END_TEXT", "")
-
-# --------------------------- Auth helpers ---------------------------
 
 def _env_token() -> str:
     token = os.getenv("WEBHOOK_VERIFY_TOKEN", "")
@@ -69,17 +65,13 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
     if expected and provided != expected:
         raise HTTPException(status_code=403, detail="Invalid webhook token")
 
-# --------------------------- Payload helpers ---------------------------
-
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
 TEXT_KEYS_PRIORITY = (
-    # Baileys-like / variados
     "data.data.messages.0.message.conversation",
     "data.data.messages.0.message.extendedTextMessage.text",
     "messages.0.message.conversation",
     "messages.0.message.extendedTextMessage.text",
-    # Uazapi simples
     "messages.0.text",
     "data.text",
     "data.message",
@@ -89,7 +81,6 @@ TEXT_KEYS_PRIORITY = (
     "body",
     "content",
     "caption",
-    # botões / listas (variações)
     "messages.0.message.templateButtonReplyMessage.selectedDisplayText",
     "messages.0.message.buttonsResponseMessage.selectedButtonId",
     "messages.0.message.listResponseMessage.title",
@@ -200,8 +191,6 @@ def _is_from_me(event: Dict[str, Any]) -> bool:
 
 def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     msg = _deep_get(event, "data.data.messages.0") or _deep_get(event, "messages.0") or {}
-    message_obj = msg.get("message", {}) if isinstance(msg, dict) else {}
-
     phone: Optional[str] = None
     for p in (
         _deep_get(msg, "key.remoteJid"),
@@ -269,8 +258,6 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
     return {"phone": phone, "msg_type": msg_type, "text": text}
 
-# --------------------------- POS/Fluxo helpers ---------------------------
-
 _POSITIVE_WORDS = {
     "sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim", "pode continuar",
     "vamos", "bora", "manda", "mande", "envia", "enviar", "segue", "segue sim",
@@ -317,9 +304,6 @@ def _is_positive_reply(text: Optional[str]) -> bool:
     return False
 
 def _looks_like_invite(reply_text: str) -> bool:
-    """
-    Detecta frases do tipo 'convite' da IA (quer ver em 30s..., posso te mostrar..., apresentar um case...).
-    """
     if not reply_text:
         return False
     t = _normalize(reply_text)
@@ -378,7 +362,6 @@ def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool]:
     wants_video = "enviar_video" in t or ("enviar" in t and "vídeo" in t) or ("mandar" in t and "vídeo" in t)
     return (wants_menu, wants_video)
 
-# ================== endpoints ('' e '/') para evitar 307 ==================
 @router.head("")
 @router.head("/")
 async def head_check(
@@ -400,9 +383,7 @@ async def get_verify(
         return PlainTextResponse(hub_challenge, status_code=200, media_type="text/plain")
     return JSONResponse({"ok": True})
 
-# --------------------------- processamento assíncrono ---------------------------
 async def _process_message_async(phone: str, msg_type: str, text: Optional[str], push_name: Optional[str]) -> None:
-    """Processa a mensagem fora do ciclo do request para evitar timeouts/499."""
     try:
         async with SessionLocal() as session:
             res = await session.execute(select(User).where(User.phone == phone))
@@ -469,7 +450,6 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
     except Exception as exc:
         print(f"[bg] unexpected error: {exc!r}")
 
-# --------------------------- webhook ---------------------------
 @router.post("")
 @router.post("/")
 async def webhook_post(
