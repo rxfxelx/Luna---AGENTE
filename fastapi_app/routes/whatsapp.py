@@ -4,7 +4,7 @@ Webhook e endpoints para WhatsApp (Uazapi).
 
 Fluxo resumido:
 - Encaminha TODO texto do lead para a IA (Assistant), com contexto do estado (caixinha/vídeo) + phone do lead.
-- Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints por texto ou por tag #tools()).
+- Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints por texto, por tag #tools() ou por tools do Assistants v2).
 - Fallback opcional: vídeo após SIM na caixinha (configurável).
 - Handoff: quando a IA sinaliza (função/texto), notifica consultores em outro chat.
 - Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações.
@@ -26,7 +26,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_db, SessionLocal
 from ..models.db_models import Message, User
-from ..services.openai_service import ask_assistant, get_or_create_thread
+# NEW: import do helper com tools; mantemos o ask_assistant clássico para compat
+from ..services.openai_service import (
+    ask_assistant,
+    ask_assistant_actions,  # NEW
+    get_or_create_thread,
+)
 from ..services.uazapi_service import send_whatsapp_message, send_menu_interesse
 
 router = APIRouter(tags=["whatsapp-webhook"])
@@ -34,23 +39,14 @@ router = APIRouter(tags=["whatsapp-webhook"])
 # =========================== ENV & helpers ===========================
 
 def _env_str(key: str, default: str = "") -> str:
-    # remove aspas e espaços extras vindos do painel (Railway etc.)
     return (os.getenv(key, default) or "").strip().strip('"').strip("'")
 
 def _env_template(key: str, default: str = "") -> str:
-    """
-    Lê um template de ENV e normaliza:
-      - remove prefixo acidental "HANDOFF_NOTIFY_TEMPLATE=" se o usuário colou junto
-      - retira aspas de borda
-      - converte literais \n, \r, \t em quebras reais
-    """
     raw = os.getenv(key, default) or ""
     raw = raw.strip()
     raw = re.sub(r'^\s*HANDOFF_NOTIFY_TEMPLATE\s*=\s*', '', raw, flags=re.I)
-    # tira aspas de borda se houver
     if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
         raw = raw[1:-1]
-    # normaliza escapes
     raw = raw.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
     return raw
 
@@ -64,11 +60,9 @@ LUNA_VIDEO_CAPTION    = _env_str("LUNA_VIDEO_CAPTION", "")
 LUNA_VIDEO_AFTER_TEXT = _env_str("LUNA_VIDEO_AFTER_TEXT", "")
 LUNA_END_TEXT         = _env_str("LUNA_END_TEXT", "")
 
-# Se "true", NÃO usa fallback automático para vídeo após caixinha SIM (100% IA decide)
 LUNA_STRICT_ASSISTANT = _env_str("LUNA_STRICT_ASSISTANT", "false").lower() == "true"
 
-# Notificação externa (handoff)
-HANDOFF_NOTIFY_NUMBERS = _env_str("HANDOFF_NOTIFY_NUMBERS", "")  # "5531999999999,5531888888888"
+HANDOFF_NOTIFY_NUMBERS = _env_str("HANDOFF_NOTIFY_NUMBERS", "")
 HANDOFF_NOTIFY_TEMPLATE = _env_template(
     "HANDOFF_NOTIFY_TEMPLATE",
     "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
@@ -106,12 +100,10 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
 TEXT_KEYS_PRIORITY = (
-    # Baileys-like / variados
     "data.data.messages.0.message.conversation",
     "data.data.messages.0.message.extendedTextMessage.text",
     "messages.0.message.conversation",
     "messages.0.message.extendedTextMessage.text",
-    # Uazapi simples
     "messages.0.text",
     "data.text",
     "data.message",
@@ -121,7 +113,6 @@ TEXT_KEYS_PRIORITY = (
     "body",
     "content",
     "caption",
-    # respostas de botões/listas (variações)
     "messages.0.message.templateButtonReplyMessage.selectedDisplayText",
     "messages.0.message.buttonsResponseMessage.selectedButtonId",
     "messages.0.message.listResponseMessage.title",
@@ -457,7 +448,6 @@ def _build_handoff_text(user: User, phone: str, last_msg: Optional[str]) -> str:
     name = (user.name or "").strip() or "—"
     last = (last_msg or "").strip() or "—"
     wa_link = f"https://wa.me/{digits}" if digits else ""
-
     tpl = HANDOFF_NOTIFY_TEMPLATE
     try:
         return tpl.format(name=name, digits=digits, last=last, wa_link=wa_link)
@@ -563,7 +553,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
             menu_recent    = await _has_recent_menu(session, user.id, minutes=30)
             video_recent   = await _has_recent_video(session, user.id, minutes=30)
-            handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)  # <-- corrigido
+            handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)  # FIX: sem ':' aqui
 
             # 1) Texto -> consulta IA (sempre), com CONTEXTO do estado + PHONE
             if msg_type == "text" and text:
@@ -588,42 +578,63 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         prefix = "Contexto: foi enviada uma caixinha de interesse ao lead. Mensagem do lead: "
 
                 ai_input = (meta_phone + prefix + (text or "")).strip()
-                reply_text = await ask_assistant(thread_id, ai_input) or ""
 
-                wants_menu, wants_video, wants_handoff = _parse_tool_hints(reply_text)
+                # NEW: Usa a versão que entende tools do Assistants v2
+                try:
+                    result = await ask_assistant_actions(thread_id, ai_input)
+                except Exception as exc:
+                    print(f"[ai] ask_assistant_actions falhou, usando fallback simples: {exc!r}")
+                    result = {"reply_text": await ask_assistant(thread_id, ai_input), "actions": []}
 
-                # 1.a) Se a IA pediu caixinha/convite
-                if (wants_menu or _looks_like_invite(reply_text)) and not menu_recent:
+                reply_text: str = result.get("reply_text") or ""
+                actions = result.get("actions", []) or []
+
+                # Marcações por texto/tag continuam valendo (retrocompat)
+                wants_menu_txt, wants_video_txt, wants_handoff_txt = _parse_tool_hints(reply_text)
+
+                # Marcações vindas das tools do Assistants v2
+                wants_menu_tool = any(a.get("name") in {"enviar_caixinha_interesse"} for a in actions)
+                wants_video_tool = any(a.get("name") in {"enviar_video"} for a in actions)
+                wants_handoff_tool = any(a.get("name") in {"enviar_msg"} for a in actions)
+
+                wants_menu = wants_menu_txt or wants_menu_tool or _looks_like_invite(reply_text)
+                wants_video = wants_video_txt or wants_video_tool
+                wants_handoff = wants_handoff_txt or wants_handoff_tool
+
+                # 1.a) Executa as ações pedidas
+                if wants_handoff and not handoff_recent:
+                    await _notify_consultants(session, user=user, phone=phone, user_text=text)
+                    # não fazemos return: a IA pode ter também uma resposta textual
+
+                if wants_menu and not menu_recent:
                     await _enviar_menu(session, phone, user)
+                    # se a IA pediu menu, normalmente não mandamos texto convite junto
                     return
-                if (wants_menu or _looks_like_invite(reply_text)) and menu_recent:
+                elif wants_menu and menu_recent:
                     print("[guard] IA/convite pediu caixinha, mas já existe recente; ignorando convite.")
 
-                # 1.b) Se a IA pediu VÍDEO
                 if wants_video and not video_recent:
                     await _enviar_video(session, phone, user)
                     return
-                if wants_video and video_recent:
+                elif wants_video and video_recent:
                     print("[guard] IA pediu vídeo, mas já enviamos recentemente; ignorando.")
 
-                # 1.c) HANDOFF: notificar consultores (uma vez por janela)
-                if wants_handoff and not handoff_recent:
-                    await _notify_consultants(session, user=user, phone=phone, user_text=text)
-                    # segue respondendo ao lead com o próprio reply_text da IA
-
-                # 1.d) Fallback opcional — vídeo após SIM na caixinha (se IA não mandou)
+                # 1.b) Fallback opcional — vídeo após SIM na caixinha (se IA não mandou)
                 if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
                     await _enviar_video(session, phone, user)
                     return
 
-                # 1.e) Anti-eco (convite) após caixinha
+                # 1.c) Anti-eco (convite) após caixinha
                 if menu_recent and _looks_like_invite(reply_text):
                     print("[guard] menu enviado há pouco; suprimindo texto convite duplicado.")
                     return
 
-                # 1.f) Texto normal para o lead (SEM as tags #tools(...))
+                # 1.d) Texto normal para o lead (SEM as tags #tools(...))
                 clean_text = _strip_tool_tags(reply_text) or "Certo!"
                 try:
+                    # Também tratamos o fallback antigo do seu openai_service (se aparecer)
+                    if "Não consegui concluir uma ação solicitada pela IA" in clean_text:
+                        clean_text = "Tudo bem! Podemos tentar de novo."
                     await send_whatsapp_message(phone=phone, content=clean_text, type_="text")
                 except Exception as e:
                     print(f"[uazapi] send failed (bg): {e!r}")
