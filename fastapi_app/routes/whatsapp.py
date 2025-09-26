@@ -563,7 +563,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
             menu_recent    = await _has_recent_menu(session, user.id, minutes=30)
             video_recent   = await _has_recent_video(session, user.id, minutes=30)
-            handoff_recent = await _has_recent_handoff(session, user.id, minutes: =30)
+            handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)  # <-- corrigido
 
             # 1) Texto -> consulta IA (sempre), com CONTEXTO do estado + PHONE
             if msg_type == "text" and text:
