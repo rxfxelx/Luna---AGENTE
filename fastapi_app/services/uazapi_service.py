@@ -215,7 +215,6 @@ async def send_menu_interesse(
       - {"number","type":"button","text","choices":[...],"footerText"}
       - {"number","type":"button","text","buttons":[{"id","title"},...]}
       - {"number","text","button1Label","button2Label"}
-      - variações com "phone" e "chatId"
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
@@ -242,8 +241,13 @@ async def send_menu_interesse(
             **({"footerText": footer_text} if footer_text else {}),
         },
         # Fallback antigo
-        {"number": digits, "text": text, "button1Label": yes_label, "button2Label": no_label},
-        # Variações com "phone"
+        {
+            "number": digits,
+            "text": text,
+            "button1Label": yes_label,
+            "button2Label": no_label,
+        },
+        # Variação "phone"
         {
             "phone": digits,
             "type": "button",
@@ -251,25 +255,6 @@ async def send_menu_interesse(
             "choices": [yes_label, no_label],
             **({"footerText": footer_text} if footer_text else {}),
         },
-        # Variações com "chatId"
-        {
-            "chatId": f"{digits}@c.us",
-            "type": "button",
-            "text": text,
-            "choices": [yes_label, no_label],
-            **({"footerText": footer_text} if footer_text else {}),
-        },
-        {
-            "chatId": f"{digits}@c.us",
-            "type": "button",
-            "text": text,
-            "buttons": [
-                {"id": "yes", "title": yes_label},
-                {"id": "no",  "title": no_label},
-            ],
-            **({"footerText": footer_text} if footer_text else {}),
-        },
-        {"chatId": f"{digits}@c.us", "text": text, "button1Label": yes_label, "button2Label": no_label},
     ]
 
     form_variants = json_variants  # os mesmos payloads servem como form
@@ -310,7 +295,7 @@ async def upload_file_to_baserow(media_url: str) -> Optional[dict]:
             file_resp = await client.get(media_url)
             file_resp.raise_for_status()
             file_bytes = file_resp.content
-            filename = media_url.split("/")[-1].split("?")[-1] or "file"
+            filename = media_url.split("/")[-1].split("?")[0] or "file"
             files = {"file": (filename, file_bytes)}
             headers = {"Authorization": f"Token {BASEROW_API_TOKEN}"}
 
