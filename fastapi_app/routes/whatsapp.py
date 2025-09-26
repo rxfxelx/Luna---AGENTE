@@ -3,13 +3,11 @@
 Webhook e endpoints para WhatsApp (Uazapi).
 
 Fluxo resumido:
-- Sempre encaminha a mensagem do usuário para a IA (Assistant), com contexto do estado (caixinha/vídeo).
-- Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints). Fallback/passo curto:
-  se acabou de enviar caixinha e o usuário clicou SIM -> envia o VÍDEO imediatamente.
-- Handoff: quando a IA sinaliza (por função "enviar_msg" ou por texto natural),
-  envia mensagem EXTERNA para os consultores (outro chat) com os dados do lead.
-- Deduplicação de webhooks inbound (mesmo texto+tipo ≤ 5s).
-- Anti-duplicação de ações (menu/vídeo/handoff recentes).
+- Encaminha TODO texto do lead para a IA (Assistant), com contexto do estado (caixinha/vídeo).
+- Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints por texto ou por tag #tools()).
+- Fallback opcional: vídeo após SIM na caixinha (configurável).
+- Handoff: quando a IA sinaliza (função/texto), notifica consultores em outro chat.
+- Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações.
 """
 
 from __future__ import annotations
@@ -33,10 +31,28 @@ from ..services.uazapi_service import send_whatsapp_message, send_menu_interesse
 
 router = APIRouter(tags=["whatsapp-webhook"])
 
-# --------------------------- ENV (Luna) ---------------------------
+# =========================== ENV & helpers ===========================
 
 def _env_str(key: str, default: str = "") -> str:
+    # remove aspas e espaços extras vindos do painel (Railway etc.)
     return (os.getenv(key, default) or "").strip().strip('"').strip("'")
+
+def _env_template(key: str, default: str = "") -> str:
+    """
+    Lê um template de ENV e normaliza:
+      - remove prefixo acidental "HANDOFF_NOTIFY_TEMPLATE=" se o usuário colou junto
+      - retira aspas de borda
+      - converte literais \n, \r, \t em quebras reais
+    """
+    raw = os.getenv(key, default) or ""
+    raw = raw.strip()
+    raw = re.sub(r'^\s*HANDOFF_NOTIFY_TEMPLATE\s*=\s*', '', raw, flags=re.I)
+    # tira aspas de borda se houver
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        raw = raw[1:-1]
+    # normaliza escapes
+    raw = raw.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+    return raw
 
 LUNA_MENU_YES     = _env_str("LUNA_MENU_YES", "Sim, pode continuar")
 LUNA_MENU_NO      = _env_str("LUNA_MENU_NO", "Não, encerrar contato")
@@ -48,15 +64,16 @@ LUNA_VIDEO_CAPTION    = _env_str("LUNA_VIDEO_CAPTION", "")
 LUNA_VIDEO_AFTER_TEXT = _env_str("LUNA_VIDEO_AFTER_TEXT", "")
 LUNA_END_TEXT         = _env_str("LUNA_END_TEXT", "")
 
-# Se "true", NÃO usa fallback automático para vídeo após caixinha SIM (tudo 100% IA)
+# Se "true", NÃO usa fallback automático para vídeo após caixinha SIM (100% IA decide)
 LUNA_STRICT_ASSISTANT = _env_str("LUNA_STRICT_ASSISTANT", "false").lower() == "true"
 
 # Notificação externa (handoff)
-HANDOFF_NOTIFY_NUMBERS   = _env_str("HANDOFF_NOTIFY_NUMBERS", "")   # ex.: "5531999999999, 5531988888888"
-HANDOFF_NOTIFY_TEMPLATE  = _env_str(
+HANDOFF_NOTIFY_NUMBERS = _env_str("HANDOFF_NOTIFY_NUMBERS", "")  # "5531999999999,5531888888888"
+HANDOFF_NOTIFY_TEMPLATE = _env_template(
     "HANDOFF_NOTIFY_TEMPLATE",
     "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
-    "Nome: {name}\nTelefone: +{digits}\nÚltima mensagem: {last}\nOrigem: WhatsApp"
+    "Nome: {name}\nTelefone: +{digits}\nÚltima mensagem: {last}\nOrigem: WhatsApp\n"
+    "Link: {wa_link}"
 )
 
 # --------------------------- Auth helpers ---------------------------
@@ -282,14 +299,13 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
     return {"phone": phone, "msg_type": msg_type, "text": text}
 
-# --------------------------- POS/Fluxo helpers ---------------------------
+# --------------------------- Fluxo helpers ---------------------------
 
 _POSITIVE_WORDS = {
     "sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim", "pode continuar",
     "vamos", "bora", "manda", "mande", "envia", "enviar", "segue", "segue sim",
     "quero", "tenho interesse", "interessa", "top", "show", "positivo", "agora",
     "mais tarde", "sim pode", "pode mandar", "pode enviar", "pode mostrar",
-    "yes", "y", "1"  # botões com id/valor simplificado
 }
 _POSITIVE_EMOJIS = {"👍", "👌", "✅", "✔️", "✌️", "🤝"}
 
@@ -327,8 +343,7 @@ def _is_positive_reply(text: Optional[str]) -> bool:
     if not text:
         return False
     t = _normalize(text)
-    # match direto aos rótulos e ids conhecidos
-    if t in {_normalize(LUNA_MENU_YES), "sim", "yes", "y", "1"}:
+    if t in {_normalize(LUNA_MENU_YES), "sim"}:
         return True
     if any(e in text for e in _POSITIVE_EMOJIS):
         return True
@@ -354,12 +369,32 @@ def _looks_like_invite(reply_text: str) -> bool:
     t = _normalize(reply_text)
     return any(p in t for p in _INVITE_PATTERNS)
 
-# --------- Handoff/helpers e tool-hints ---------
+# --------- IA tool-hints (tags e linguagem natural) ---------
 
-_TOOL_TAG_RE = re.compile(r"\[(enviar_(?:msg|caixinha_interesse|video))\]", re.IGNORECASE)
+_TOOL_TAG_RE = re.compile(r"#tools?\s*\(\s*([^)]+)\)", re.I)
+
+def _parse_tools_from_tags(reply_text: str) -> set:
+    tools: set = set()
+    if not reply_text:
+        return tools
+    m = _TOOL_TAG_RE.search(reply_text)
+    if not m:
+        return tools
+    content = m.group(1) or ""
+    parts = re.split(r"[,\s]+", content)
+    for p in parts:
+        p = p.strip().lower()
+        if not p:
+            continue
+        if p in {"enviar_caixinha_interesse", "menu", "caixinha"}:
+            tools.add("menu")
+        elif p in {"enviar_video", "video", "vídeo"}:
+            tools.add("video")
+        elif p in {"enviar_msg", "handoff", "transfer"}:
+            tools.add("handoff")
+    return tools
 
 def _looks_like_handoff(reply_text: str) -> bool:
-    """Detecta falas naturais do assistant indicando handoff."""
     if not reply_text:
         return False
     t = _normalize(reply_text)
@@ -381,6 +416,15 @@ def _looks_like_handoff(reply_text: str) -> bool:
     )
     return any(p in t for p in patterns)
 
+def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool, bool]:
+    tags = _parse_tools_from_tags(reply_text)
+    wants_menu = ("menu" in tags) or ("enviar_caixinha_interesse" in reply_text.lower()) or _looks_like_invite(reply_text)
+    wants_video = ("video" in tags) or ("enviar_video" in reply_text.lower())
+    wants_handoff = ("handoff" in tags) or _looks_like_handoff(reply_text)
+    return (wants_menu, wants_video, wants_handoff)
+
+# --------- Handoff helpers ---------
+
 def _parse_notify_numbers(raw: str) -> List[str]:
     nums: List[str] = []
     for token in re.split(r"[,\s;]+", raw or ""):
@@ -389,16 +433,36 @@ def _parse_notify_numbers(raw: str) -> List[str]:
             nums.append(digits)
     return nums
 
+async def _get_last_user_text(session: AsyncSession, user_id: int) -> Optional[str]:
+    try:
+        q = (
+            select(Message)
+            .where(Message.user_id == user_id, Message.sender == "user", Message.media_type == "text")
+            .order_by(desc(Message.created_at))
+            .limit(1)
+        )
+        res = await session.execute(q)
+        last = res.scalar_one_or_none()
+        return (last.content or "").strip() if last else None
+    except Exception:
+        return None
+
 def _build_handoff_text(user: User, phone: str, last_msg: Optional[str]) -> str:
     digits = _only_digits(phone)
-    name = (user.name or "—").strip()
-    last = (last_msg or "—").strip()
+    name = (user.name or "").strip() or "—"
+    last = (last_msg or "").strip() or "—"
+    wa_link = f"https://wa.me/{digits}" if digits else ""
+
+    tpl = HANDOFF_NOTIFY_TEMPLATE
+    # Formatação segura: se houver placeholder desconhecido, não quebra
     try:
-        return HANDOFF_NOTIFY_TEMPLATE.format(name=name, digits=digits, last=last)
-    except Exception:
+        return tpl.format(name=name, digits=digits, last=last, wa_link=wa_link)
+    except Exception as exc:
+        print(f"[handoff] template format error: {exc!r}; using fallback.")
         return (
             "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
-            f"Nome: {name}\nTelefone: +{digits}\nÚltima mensagem: {last}\nOrigem: WhatsApp"
+            f"Nome: {name}\nTelefone: +{digits}\nÚltima mensagem: {last}\nOrigem: WhatsApp\n"
+            f"Link: {wa_link}"
         )
 
 async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, user_text: Optional[str]) -> None:
@@ -406,67 +470,18 @@ async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, 
     if not targets:
         print("[handoff] HANDOFF_NOTIFY_NUMBERS vazio ou inválido; nenhuma notificação enviada.")
         return
-    alert = _build_handoff_text(user, phone, user_text)
+    last = (user_text or "").strip() or await _get_last_user_text(session, user.id)
+    alert = _build_handoff_text(user, phone, last)
     for t in targets:
         try:
             await send_whatsapp_message(phone=t, content=alert, type_="text")
         except Exception as e:
             print(f"[handoff] falha ao notificar {t}: {e!r}")
+    # registra para anti-duplicação
     session.add(Message(user_id=user.id, sender="assistant", content=alert, media_type="handoff"))
     await session.commit()
 
-def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool, bool]:
-    """Suporta palavras soltas e tags [enviar_video]/[enviar_caixinha_interesse]/[enviar_msg]."""
-    if not reply_text:
-        return (False, False, False)
-
-    t = reply_text.lower()
-    # palavras/expressões
-    wants_menu = ("enviar_caixinha_interesse" in t) or ("caixinha" in t and "enviar" in t)
-    wants_video = ("enviar_video" in t) or ("enviar" in t and "vídeo" in t) or ("mandar" in t and "vídeo" in t)
-    wants_handoff = ("enviar_msg" in t) or _looks_like_handoff(reply_text)
-
-    # tags entre colchetes
-    for m in _TOOL_TAG_RE.findall(reply_text or ""):
-        mm = m.lower()
-        if mm == "enviar_caixinha_interesse":
-            wants_menu = True
-        elif mm == "enviar_video":
-            wants_video = True
-        elif mm == "enviar_msg":
-            wants_handoff = True
-
-    return (wants_menu, wants_video, wants_handoff)
-
-# --------------------------- Deduplicação de inbound ---------------------------
-
-async def _is_probably_duplicate(db: AsyncSession, user_id: int, text: Optional[str], msg_type: str, window_seconds: int = 5) -> bool:
-    """Dedup simples: mesmo conteúdo+tipo do último inbound no intervalo definido."""
-    try:
-        q = (
-            select(Message)
-            .where(Message.user_id == user_id, Message.sender == "user")
-            .order_by(desc(Message.created_at))
-            .limit(1)
-        )
-        res = await db.execute(q)
-        last = res.scalar_one_or_none()
-        if not last:
-            return False
-        last_text = last.content or ""
-        now = datetime.utcnow()
-        last_at = last.created_at
-        if getattr(last_at, "tzinfo", None) is not None:
-            last_at = last_at.replace(tzinfo=None)
-        same_text = (last_text or "").strip() == (text or "").strip()
-        same_type = (last.media_type or "") == (msg_type or "")
-        recent = (now - last_at) <= timedelta(seconds=window_seconds)
-        return bool(same_text and same_type and recent)
-    except Exception as exc:
-        print(f"[dedup] erro na checagem de duplicidade: {exc!r}")
-        return False
-
-# --------------------------- Ações (menu/vídeo) ---------------------------
+# --------- Ações de saída ---------
 
 async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
     if not LUNA_MENU_TEXT:
@@ -480,8 +495,7 @@ async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
             no_label=LUNA_MENU_NO or "Não",
             footer_text=LUNA_MENU_FOOTER or None,
         )
-        out = Message(user_id=user.id, sender="assistant", content=LUNA_MENU_TEXT, media_type="menu")
-        session.add(out)
+        session.add(Message(user_id=user.id, sender="assistant", content=LUNA_MENU_TEXT, media_type="menu"))
         await session.commit()
         print("[menu] enviado com sucesso.")
     except Exception as exc:
@@ -544,15 +558,9 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await session.commit()
                 await session.refresh(user)
 
-            # Estado
             menu_recent    = await _has_recent_menu(session, user.id, minutes=30)
             video_recent   = await _has_recent_video(session, user.id, minutes=30)
             handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)
-
-            # 0) Atalho pós-caixinha: SIM -> envia VÍDEO já (independente do modo estrito)
-            if msg_type == "text" and text and menu_recent and not video_recent and _is_positive_reply(text):
-                await _enviar_video(session, phone, user)
-                return
 
             # 1) Texto -> consulta IA (sempre), com CONTEXTO do estado
             if msg_type == "text" and text:
@@ -566,9 +574,9 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     )
                 elif menu_recent:
                     tnorm = _normalize(text)
-                    if tnorm in {_normalize(LUNA_MENU_YES), "sim", "yes", "y", "1"}:
+                    if tnorm in {_normalize(LUNA_MENU_YES), "sim"} or "sim" in tnorm:
                         prefix = "Contexto: o lead respondeu SIM na caixinha de interesse. Mensagem do lead: "
-                    elif tnorm in {_normalize(LUNA_MENU_NO), "nao", "não", "no"}:
+                    elif tnorm in {_normalize(LUNA_MENU_NO), "nao", "não"} or "nao" in tnorm or "não" in tnorm:
                         prefix = "Contexto: o lead respondeu NÃO na caixinha de interesse. Mensagem do lead: "
                     else:
                         prefix = "Contexto: foi enviada uma caixinha de interesse ao lead. Mensagem do lead: "
@@ -585,7 +593,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 if (wants_menu or _looks_like_invite(reply_text)) and menu_recent:
                     print("[guard] IA/convite pediu caixinha, mas já existe recente; ignorando convite.")
 
-                # 1.b) Se a IA pediu VÍDEO -> envia se ainda não houver vídeo recente
+                # 1.b) Se a IA pediu VÍDEO
                 if wants_video and not video_recent:
                     await _enviar_video(session, phone, user)
                     return
@@ -595,10 +603,10 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 # 1.c) HANDOFF: notificar consultores (uma vez por janela)
                 if wants_handoff and not handoff_recent:
                     await _notify_consultants(session, user=user, phone=phone, user_text=text)
-                    # continua conversando normalmente com o lead
+                    # segue respondendo ao lead com o próprio reply_text da IA
 
-                # 1.d) Fallback opcional — vídeo após caixinha SIM (caso IA não tenha pedido)
-                if (not LUNA_STRICT_ASSISTANT) and menu_recent and not video_recent and _is_positive_reply(text):
+                # 1.d) Fallback opcional — vídeo após SIM na caixinha (se IA não mandou)
+                if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
                     await _enviar_video(session, phone, user)
                     return
 
@@ -607,14 +615,13 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     print("[guard] menu enviado há pouco; suprimindo texto convite duplicado.")
                     return
 
-                # 1.f) Texto normal
+                # 1.f) Texto normal para o lead
                 try:
                     await send_whatsapp_message(phone=phone, content=reply_text or "Certo!", type_="text")
                 except Exception as e:
                     print(f"[uazapi] send failed (bg): {e!r}")
 
-                out_msg = Message(user_id=user.id, sender="assistant", content=reply_text or "Certo!", media_type="text")
-                session.add(out_msg)
+                session.add(Message(user_id=user.id, sender="assistant", content=reply_text or "Certo!", media_type="text"))
                 await session.commit()
                 return
 
@@ -624,8 +631,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 await send_whatsapp_message(phone=phone, content=ack, type_="text")
             except Exception as e:
                 print(f"[uazapi] send failed (bg): {e!r}")
-            out_msg = Message(user_id=user.id, sender="assistant", content=ack, media_type="text")
-            session.add(out_msg)
+            session.add(Message(user_id=user.id, sender="assistant", content=ack, media_type="text"))
             await session.commit()
 
     except Exception as exc:
@@ -689,6 +695,33 @@ async def webhook_post(
 
     asyncio.create_task(_process_message_async(phone=phone, msg_type=msg_type, text=text, push_name=push_name))
     return JSONResponse({"received": True}, status_code=200)
+
+# --------------------------- dedup inbound helper ---------------------------
+async def _is_probably_duplicate(db: AsyncSession, user_id: int, text: Optional[str], msg_type: str, window_seconds: int = 5) -> bool:
+    """Dedup simples: mesmo conteúdo+tipo do último inbound dentro da janela."""
+    try:
+        q = (
+            select(Message)
+            .where(Message.user_id == user_id, Message.sender == "user")
+            .order_by(desc(Message.created_at))
+            .limit(1)
+        )
+        res = await db.execute(q)
+        last = res.scalar_one_or_none()
+        if not last:
+            return False
+        last_text = last.content or ""
+        now = datetime.utcnow()
+        last_at = last.created_at
+        if getattr(last_at, "tzinfo", None) is not None:
+            last_at = last_at.replace(tzinfo=None)
+        same_text = (last_text or "").strip() == (text or "").strip()
+        same_type = (last.media_type or "") == (msg_type or "")
+        recent = (now - last_at) <= timedelta(seconds=window_seconds)
+        return bool(same_text and same_type and recent)
+    except Exception as exc:
+        print(f"[dedup] erro na checagem de duplicidade: {exc!r}")
+        return False
 
 def get_router() -> APIRouter:
     return router
