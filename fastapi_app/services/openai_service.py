@@ -1,20 +1,18 @@
 # fastapi_app/services/openai_service.py
 """
-Integração com OpenAI Assistants v2, com polling de Run e execução de tools.
+Integração com OpenAI Assistants v2.
 
-Expõe:
+Principais funções expostas:
 - get_or_create_thread(session, user) -> str
-- ask_assistant(thread_id: str, user_text: str) -> str  (retorna o texto final do assistant)
+- ask_assistant_actions(thread_id: str, text: str) -> dict
+    Retorna {"reply_text": str, "actions": [{"name": str, "args": dict}, ...]}
+- ask_assistant(thread_id: str, text: str) -> str
+    Compatibilidade: retorna apenas o texto final do assistant.
 
-Tools suportadas (usadas pelo Assistant):
-- enviar_caixinha_interesse(phone?, text?, yes_label?, no_label?, footer_text?)
-- enviar_video(phone?, url?, caption?, mime_type?)
-- enviar_msg(phone, name?, last?)  -> notifica consultores (handoff)
-
-Observações:
-- Este módulo NÃO envia nada por conta própria ao usuário final, exceto quando uma tool do Assistant
-  explicitamente pede (menu/vídeo/handoff). O texto final do Assistant é retornado para o `whatsapp.py`,
-  que decide enviar (e já possui as proteções anti-eco/convite duplicado).
+Observações importantes:
+- Quando o run entra em `requires_action`, coletamos as tool-calls e
+  SUBMETEMOS tool_outputs "OK" para liberar o run e obter a resposta final.
+  Também devolvemos as ações para o caller executá-las (ex.: enviar menu/vídeo).
 """
 
 from __future__ import annotations
@@ -22,389 +20,192 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
+from openai import AsyncOpenAI
 
-from ..models.db_models import User
-from .uazapi_service import (
-    send_menu_interesse,
-    send_whatsapp_message,
-)
+from ..models.db_models import User  # apenas para type hints, se quiser
 
-# ============================ ENV / Config ============================
 
-OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-ASSISTANT_ID = (os.getenv("ASSISTANT_ID") or "").strip()
+# -------------------- ENV --------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+ASSISTANT_ID = os.getenv("ASSISTANT_ID", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Defaults (caso o Assistant não passe argumentos na tool)
-LUNA_MENU_YES = (os.getenv("LUNA_MENU_YES") or "Sim, pode continuar").strip()
-LUNA_MENU_NO = (os.getenv("LUNA_MENU_NO") or "Não, encerrar contato").strip()
-LUNA_MENU_TEXT = (os.getenv("LUNA_MENU_TEXT") or "").strip()
-LUNA_MENU_FOOTER = (os.getenv("LUNA_MENU_FOOTER") or "Escolha uma das opções abaixo").strip()
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY não configurada.")
+if not ASSISTANT_ID:
+    # não paramos a app, mas avisamos
+    print("[openai] WARN: ASSISTANT_ID não configurado – use tools por texto (#tools(...)) ou configure o ID.")
 
-LUNA_VIDEO_URL = (os.getenv("LUNA_VIDEO_URL") or "").strip()
-LUNA_VIDEO_CAPTION = (os.getenv("LUNA_VIDEO_CAPTION") or "").strip()
+_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Handoff (aviso para consultores)
-def _env_template(key: str, default: str = "") -> str:
-    raw = os.getenv(key, default) or ""
-    raw = raw.strip()
-    # Corrige casos do painel onde colaram "HANDOFF_NOTIFY_TEMPLATE=..."
-    if raw.upper().startswith("HANDOFF_NOTIFY_TEMPLATE="):
-        raw = raw.split("=", 1)[1]
-    # Tira aspas de borda
-    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
-        raw = raw[1:-1]
-    # Normaliza escapes \n, \r, \t
-    return raw.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
 
-HANDOFF_NOTIFY_NUMBERS = (os.getenv("HANDOFF_NOTIFY_NUMBERS") or "").strip()
-HANDOFF_NOTIFY_TEMPLATE = _env_template(
-    "HANDOFF_NOTIFY_TEMPLATE",
-    "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
-    "Nome: {name}\nTelefone: +{digits}\nÚltima mensagem: {last}\nOrigem: WhatsApp\n"
-    "Link: {wa_link}"
-)
-
-# Quando True, NÃO faz fallback de vídeo após SIM na caixinha (100% a IA decide).
-LUNA_STRICT_ASSISTANT = (os.getenv("LUNA_STRICT_ASSISTANT", "false") or "false").lower() == "true"
-
-_HEADERS = {
-    "Authorization": f"Bearer {OPENAI_API_KEY}",
-    "OpenAI-Beta": "assistants=v2",
-}
-
-# ============================ Helpers OpenAI ============================
-
-async def _openai_post(url: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, headers=_HEADERS, json=json_body)
-        resp.raise_for_status()
-        return resp.json()
-
-async def _openai_get(url: str) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.get(url, headers=_HEADERS)
-        resp.raise_for_status()
-        return resp.json()
-
-async def _create_thread() -> str:
-    data = await _openai_post("https://api.openai.com/v1/threads", {})
-    return data["id"]
-
-async def _append_message(thread_id: str, role: str, text: str) -> None:
-    await _openai_post(
-        f"https://api.openai.com/v1/threads/{thread_id}/messages",
-        {"role": role, "content": text},
-    )
-
-async def _create_run(thread_id: str, assistant_id: str) -> str:
-    data = await _openai_post(
-        f"https://api.openai.com/v1/threads/{thread_id}/runs",
-        {"assistant_id": assistant_id},
-    )
-    return data["id"]
-
-async def _retrieve_run(thread_id: str, run_id: str) -> Dict[str, Any]:
-    return await _openai_get(
-        f"https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}"
-    )
-
-async def _submit_tool_outputs(thread_id: str, run_id: str, tool_outputs: List[Dict[str, Any]]) -> None:
-    await _openai_post(
-        f"https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}/submit_tool_outputs",
-        {"tool_outputs": tool_outputs},
-    )
-
-async def _list_messages(thread_id: str) -> List[Dict[str, Any]]:
-    data = await _openai_get(
-        f"https://api.openai.com/v1/threads/{thread_id}/messages"
-    )
-    return data.get("data", [])
-
-# ============================ Thread por usuário ============================
-
-async def get_or_create_thread(session: AsyncSession, user: User) -> str:
+# -------------------- helpers --------------------
+def _get_user_thread_attr_name(user: Any) -> Optional[str]:
     """
-    Retorna o thread_id do OpenAI para o usuário.
-    Tenta usar qualquer atributo existente no modelo (openai_thread_id | thread_id | thread).
-    Se não existir, cria e salva no primeiro atributo disponível.
+    Descobre dinamicamente qual atributo do User guarda o thread_id.
+    Tenta em ordem alguns nomes comuns.
     """
-    for attr in ("openai_thread_id", "thread_id", "thread"):
+    for attr in ("openai_thread_id", "assistant_thread_id", "thread_id", "thread"):
         if hasattr(user, attr):
-            tid = getattr(user, attr, None)
-            if tid:
-                return tid
+            return attr
+    return None
 
-    # cria se não existir
-    tid = await _create_thread()
 
-    # tenta persistir no primeiro atributo disponível
-    saved = False
-    for attr in ("openai_thread_id", "thread_id", "thread"):
-        if hasattr(user, attr):
-            setattr(user, attr, tid)
-            saved = True
-            break
+async def get_or_create_thread(session, user: User) -> str:
+    """
+    Obtém (ou cria) o thread_id e persiste no usuário.
+    Não altera seu schema: usa o primeiro atributo existente dentre:
+    openai_thread_id / assistant_thread_id / thread_id / thread.
+    Se nenhum existir, tenta usar 'openai_thread_id' (silenciosamente).
+    """
+    attr = _get_user_thread_attr_name(user) or "openai_thread_id"
+    tid: Optional[str] = getattr(user, attr, None)
+    if tid:
+        return tid
 
+    thread = await _client.beta.threads.create()
+    tid = thread.id
     try:
-        if saved:
-            session.add(user)
-            await session.commit()
+        setattr(user, attr, tid)
+        session.add(user)
+        await session.commit()
     except Exception as exc:
-        # Mesmo que não consiga salvar (campo ausente na tabela), ainda devolvemos o tid.
-        print(f"[openai] não consegui persistir thread_id no modelo User: {exc!r}")
-
+        print(f"[openai] WARN: falha ao persistir thread_id no usuário ({attr}): {exc!r}")
     return tid
 
-# ============================ Tools (execução) ============================
 
-def _only_digits(s: Any) -> str:
-    return "".join(ch for ch in str(s) if ch.isdigit())
+async def _poll_run(thread_id: str, run_id: str, *, interval: float = 0.8, timeout: float = 45.0) -> Dict[str, Any]:
+    """
+    Faz polling do run até sair de estados transitórios.
+    Retorna o objeto run final.
+    """
+    elapsed = 0.0
+    while True:
+        run = await _client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
+        status = getattr(run, "status", "")
+        if status not in {"queued", "in_progress", "requires_action"}:
+            return run.model_dump() if hasattr(run, "model_dump") else dict(run)
+        await asyncio.sleep(interval)
+        elapsed += interval
+        if elapsed >= timeout:
+            return run.model_dump() if hasattr(run, "model_dump") else dict(run)
 
-def _parse_args(arg_str_or_obj: Any) -> Dict[str, Any]:
-    """Tool arguments podem vir como string JSON; converte com segurança."""
-    if isinstance(arg_str_or_obj, dict):
-        return arg_str_or_obj
-    if not arg_str_or_obj:
-        return {}
+
+def _extract_text_from_messages(messages: Any) -> str:
+    """
+    Concatena o conteúdo textual das mensagens assistant mais recentes.
+    """
+    out_parts: List[str] = []
     try:
-        return json.loads(arg_str_or_obj)
+        for m in messages.data:
+            if m.role != "assistant":
+                continue
+            for piece in m.content or []:
+                if getattr(piece, "type", "") == "text":
+                    out_parts.append(piece.text.value or "")
+            if out_parts:
+                break  # pega apenas a primeira mensagem assistant mais recente
     except Exception:
-        return {}
-
-def _parse_notify_numbers(raw: str) -> List[str]:
-    out: List[str] = []
-    for token in raw.replace(";", ",").split(","):
-        digits = _only_digits(token)
-        if digits:
-            out.append(digits)
-    return out
-
-async def _tool_enviar_caixinha_interesse(args: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Args esperados:
-      phone (obrigatório), text?, yes_label?, no_label?, footer_text?
-    Defaults vêm do ENV se ausentes.
-    """
-    phone = args.get("phone") or args.get("numero") or ""
-    phone = _only_digits(phone)
-    if not phone:
-        return {"error": "phone ausente"}
-
-    text = (args.get("text") or LUNA_MENU_TEXT or "").strip()
-    yes_label = (args.get("yes_label") or LUNA_MENU_YES or "Sim").strip()
-    no_label = (args.get("no_label") or LUNA_MENU_NO or "Não").strip()
-    footer_text = (args.get("footer_text") or LUNA_MENU_FOOTER or None) or None
-
-    try:
-        await send_menu_interesse(
-            phone=phone,
-            text=text,
-            yes_label=yes_label,
-            no_label=no_label,
-            footer_text=footer_text,
-        )
-        return {"status": "sent"}
-    except Exception as exc:
-        print(f"[tool] enviar_caixinha_interesse failed: {exc!r}")
-        return {"error": str(exc)}
-
-async def _tool_enviar_video(args: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Args esperados:
-      phone (obrigatório), url?, caption?, mime_type?
-    Se url/legend for omitida, usa os defaults LUNA_VIDEO_URL / LUNA_VIDEO_CAPTION.
-    """
-    phone = _only_digits(args.get("phone") or "")
-    if not phone:
-        return {"error": "phone ausente"}
-
-    url = (args.get("url") or LUNA_VIDEO_URL or "").strip()
-    if not url:
-        return {"error": "url de vídeo ausente (e LUNA_VIDEO_URL vazio)"}
-
-    caption = (args.get("caption") or LUNA_VIDEO_CAPTION or "").strip()
-    mime_type = (args.get("mime_type") or None)
-
-    try:
-        await send_whatsapp_message(
-            phone=phone,
-            content=caption,
-            type_="media",
-            media_url=url,
-            mime_type=mime_type,
-            caption=caption,
-        )
-        return {"status": "sent"}
-    except Exception as exc:
-        print(f"[tool] enviar_video failed: {exc!r}")
-        return {"error": str(exc)}
-
-async def _tool_enviar_msg(args: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Notifica consultores (handoff). Espera:
-      phone (do lead) e opcionalmente name, last.
-    Usa HANDOFF_NOTIFY_NUMBERS/TEMPLATE do ENV.
-    """
-    lead_phone = _only_digits(args.get("phone") or "")
-    name = (args.get("name") or "").strip() or "—"
-    last = (args.get("last") or "").strip() or "—"
-    wa_link = f"https://wa.me/{lead_phone}" if lead_phone else ""
-
-    try:
-        template = HANDOFF_NOTIFY_TEMPLATE
+        # fallback generoso
         try:
-            body = template.format(name=name, digits=lead_phone, last=last, wa_link=wa_link)
-        except Exception as exc:
-            print(f"[handoff] template error {exc!r}; usando fallback")
-            body = (
-                "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
-                f"Nome: {name}\nTelefone: +{lead_phone}\nÚltima mensagem: {last}\nOrigem: WhatsApp\n"
-                f"Link: {wa_link}"
-            )
+            for m in messages.get("data", []):  # type: ignore[assignment]
+                if m.get("role") != "assistant":
+                    continue
+                for piece in m.get("content", []):
+                    if piece.get("type") == "text":
+                        out_parts.append(piece["text"]["value"])
+                if out_parts:
+                    break
+        except Exception:
+            pass
+    return "\n".join(p for p in out_parts if p).strip()
 
-        targets = _parse_notify_numbers(HANDOFF_NOTIFY_NUMBERS)
-        if not targets:
-            return {"error": "HANDOFF_NOTIFY_NUMBERS vazio"}
 
-        for t in targets:
+def _parse_tool_calls_from_run(run_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    A partir de um objeto run em 'requires_action', extrai as tool-calls
+    (nome e argumentos em dict).
+    """
+    actions: List[Dict[str, Any]] = []
+    try:
+        ra = run_obj.get("required_action", {}) or {}
+        st = ra.get("submit_tool_outputs", {}) or {}
+        for tc in st.get("tool_calls", []) or []:
+            func = tc.get("function", {}) or {}
+            name = (func.get("name") or "").strip()
+            args_text = func.get("arguments") or "{}"
+            args: Dict[str, Any]
             try:
-                await send_whatsapp_message(phone=t, content=body, type_="text")
-            except Exception as exc:
-                print(f"[handoff] falha ao notificar {t}: {exc!r}")
-
-        return {"status": "sent", "targets": targets}
+                args = json.loads(args_text)
+            except Exception:
+                args = {}
+            if name:
+                actions.append({"name": name, "args": args, "tool_call_id": tc.get("id")})
     except Exception as exc:
-        print(f"[tool] enviar_msg failed: {exc!r}")
-        return {"error": str(exc)}
+        print(f"[openai] WARN: falha ao extrair tool-calls: {exc!r}")
+    return actions
 
-async def _execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+
+async def ask_assistant_actions(thread_id: str, text: str) -> Dict[str, Any]:
     """
-    Executa UMA tool vinda do OpenAI (requires_action).
-    Formato típico:
-      {
-        "id": "call_xxx",
-        "type": "function",
-        "function": {"name": "...", "arguments": "{\"phone\": \"5531...\"}"}
-      }
+    Envia `text` ao thread, executa um run e retorna:
+      {"reply_text": str, "actions": [{"name": ..., "args": {...}}]}
+    Obs.: Se houver tools, SUBMETE tool_outputs "OK" para destravar o run
+    (o caller executa de verdade as ações no WhatsApp).
     """
-    tc_id = tool_call.get("id")
-    fn = tool_call.get("function") or {}
-    name = (fn.get("name") or "").strip().lower()
-    args = _parse_args(fn.get("arguments"))
+    # 1) adiciona a mensagem do usuário
+    await _client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=text or "",
+    )
 
-    if name in {"enviar_caixinha_interesse", "menu", "caixinha"}:
-        result = await _tool_enviar_caixinha_interesse(args)
-    elif name in {"enviar_video", "video", "vídeo"}:
-        result = await _tool_enviar_video(args)
-    elif name in {"enviar_msg", "handoff", "transfer"}:
-        result = await _tool_enviar_msg(args)
-    else:
-        result = {"error": f"tool desconhecida: {name}"}
-
-    # Tool outputs devem conter { "id": ..., "output": <string> } OU { "id": ..., "result": {...} }
-    # A API aceita 'output' string. Serializamos o dict result.
-    return {"id": tc_id, "output": json.dumps(result, ensure_ascii=False)}
-
-# ============================ Perguntar à IA ============================
-
-async def ask_assistant(thread_id: str, user_text: str) -> str:
-    """
-    1) Adiciona a mensagem do usuário ao thread.
-    2) Cria um Run e faz polling até concluir.
-    3) Se 'requires_action', executa tools e envia tool_outputs.
-    4) Quando 'completed', retorna o último texto do assistant.
-    5) Em caso de erro/timeout, retorna um fallback amigável.
-
-    OBS: Este método NÃO envia nada para o usuário por conta própria (exceto
-    quando a tool do Assistant explicitamente pede menu/vídeo/handoff).
-    """
-    if not OPENAI_API_KEY or not ASSISTANT_ID:
-        return "Configuração de IA ausente. Por favor, tente novamente em instantes."
-
-    # 1) adiciona mensagem do usuário
-    try:
-        await _append_message(thread_id, "user", user_text or "")
-    except Exception as exc:
-        print(f"[openai] append_message error: {exc!r}")
-        return "Não consegui falar com a IA agora. Podemos tentar de novo?"
-
-    # 2) cria run
-    try:
-        run_id = await _create_run(thread_id, ASSISTANT_ID)
-    except Exception as exc:
-        print(f"[openai] create_run error: {exc!r}")
-        return "Tive um problema ao iniciar a IA. Vamos tentar novamente já já."
+    # 2) cria o run
+    run = await _client.beta.threads.runs.create(
+        thread_id=thread_id,
+        assistant_id=ASSISTANT_ID or "",
+        model=OPENAI_MODEL or None,  # opcional
+    )
+    run_obj = run.model_dump() if hasattr(run, "model_dump") else dict(run)
 
     # 3) polling
-    MAX_WAIT_SECONDS = 120  # timeout de segurança
-    waited = 0
-    SLEEP = 4
+    run_obj = await _poll_run(thread_id, run_obj["id"])
 
-    while True:
+    actions: List[Dict[str, Any]] = []
+    # 3a) se precisa de ação, colete as tools e submeta "OK" p/ continuar
+    if run_obj.get("status") == "requires_action":
+        actions = _parse_tool_calls_from_run(run_obj)
+        tool_outputs = []
+        for a in actions:
+            # Mensagem curta só para o Assistant "acreditar" que executamos.
+            tool_outputs.append({"tool_call_id": a.get("tool_call_id"), "output": "OK"})
         try:
-            run = await _retrieve_run(thread_id, run_id)
+            await _client.beta.threads.runs.submit_tool_outputs(
+                thread_id=thread_id,
+                run_id=run_obj["id"],
+                tool_outputs=tool_outputs,
+            )
+            # poll novamente até concluir
+            run_obj = await _poll_run(thread_id, run_obj["id"])
         except Exception as exc:
-            print(f"[openai] retrieve_run error: {exc!r}")
-            return "A IA ficou indisponível no momento. Posso tentar outra vez?"
+            print(f"[openai] submit_tool_outputs falhou: {exc!r}")
 
-        status = (run.get("status") or "").lower()
-        if status in ("queued", "in_progress"):
-            await asyncio.sleep(SLEEP)
-            waited += SLEEP
-            if waited >= MAX_WAIT_SECONDS:
-                return "Demorou um pouco mais do que o normal. Posso continuar por aqui?"
-            continue
+    # 4) busca a última resposta textual do assistant
+    try:
+        msgs = await _client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=10)
+        reply_text = _extract_text_from_messages(msgs)
+    except Exception as exc:
+        print(f"[openai] WARN: falha ao ler mensagens do thread: {exc!r}")
+        reply_text = ""
 
-        if status == "requires_action":
-            ra = run.get("required_action", {})
-            submit = ra.get("submit_tool_outputs", {})
-            tool_calls = submit.get("tool_calls", []) or []
-            outputs: List[Dict[str, Any]] = []
+    return {"reply_text": reply_text, "actions": actions}
 
-            for call in tool_calls:
-                try:
-                    out = await _execute_tool_call(call)
-                    outputs.append(out)
-                except Exception as exc:
-                    print(f"[openai] tool execution error: {exc!r}")
-                    outputs.append({"id": call.get("id"), "output": json.dumps({"error": str(exc)})})
 
-            # envia tool_outputs e volta para o polling
-            try:
-                await _submit_tool_outputs(thread_id, run_id, outputs)
-            except Exception as exc:
-                print(f"[openai] submit_tool_outputs error: {exc!r}")
-                return "Não consegui concluir uma ação solicitada pela IA. Podemos tentar de novo?"
-
-            await asyncio.sleep(1)
-            continue
-
-        if status == "completed":
-            # retorna o último texto do assistant
-            try:
-                msgs = await _list_messages(thread_id)
-                for m in msgs:  # data vem em ordem decrescente (normalmente)
-                    if (m.get("role") == "assistant") and m.get("content"):
-                        # conteúdo pode ser múltiplo (text, image, etc.). Pegamos o primeiro text.
-                        for c in m["content"]:
-                            if c.get("type") == "text":
-                                val = c["text"].get("value") if isinstance(c["text"], dict) else None
-                                if val:
-                                    return val.strip()
-                return "Certo!"
-            except Exception as exc:
-                print(f"[openai] list_messages parse error: {exc!r}")
-                return "Tudo certo por aqui!"
-
-        if status in ("failed", "expired", "canceled", "cancelled"):
-            return "A IA não conseguiu concluir agora. Podemos continuar por aqui?"
-
-        # status inesperado
-        await asyncio.sleep(SLEEP)
-        waited += SLEEP
-        if waited >= MAX_WAIT_SECONDS:
-            return "Demorou um pouco mais do que o normal. Posso continuar por aqui?"
+async def ask_assistant(thread_id: str, text: str) -> str:
+    """
+    Compatibilidade: devolve apenas o texto final.
+    """
+    res = await ask_assistant_actions(thread_id, text)
+    return res.get("reply_text") or ""
