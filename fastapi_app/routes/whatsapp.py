@@ -47,12 +47,9 @@ def _env_template(key: str, default: str = "") -> str:
     raw = os.getenv(key, default) or ""
     raw = raw.strip()
     raw = re.sub(r'^\s*HANDOFF_NOTIFY_TEMPLATE\s*=\s*', '', raw, flags=re.I)
-    # tira aspas de borda se houver
     if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
         raw = raw[1:-1]
-    # normaliza escapes
-    raw = raw.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
-    return raw
+    return raw.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
 
 LUNA_MENU_YES     = _env_str("LUNA_MENU_YES", "Sim, pode continuar")
 LUNA_MENU_NO      = _env_str("LUNA_MENU_NO", "Não, encerrar contato")
@@ -301,55 +298,30 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
 # --------------------------- Fluxo helpers ---------------------------
 
-_POSITIVE_WORDS = {
-    "sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim", "pode continuar",
-    "vamos", "bora", "manda", "mande", "envia", "enviar", "segue", "segue sim",
-    "quero", "tenho interesse", "interessa", "top", "show", "positivo", "agora",
-    "mais tarde", "sim pode", "pode mandar", "pode enviar", "pode mostrar",
-}
 _POSITIVE_EMOJIS = {"👍", "👌", "✅", "✔️", "✌️", "🤝"}
 
-async def _has_recent_generic(session: AsyncSession, user_id: int, media_type: str, minutes: int) -> bool:
-    try:
-        q = (
-            select(Message)
-            .where(Message.user_id == user_id, Message.sender == "assistant", Message.media_type == media_type)
-            .order_by(desc(Message.created_at))
-            .limit(1)
-        )
-        res = await session.execute(q)
-        last = res.scalar_one_or_none()
-        if not last or not getattr(last, "created_at", None):
-            return False
-        now = datetime.utcnow()
-        last_at = last.created_at
-        if getattr(last_at, "tzinfo", None) is not None:
-            last_at = last_at.replace(tzinfo=None)
-        return (now - last_at) <= timedelta(minutes=minutes)
-    except Exception as exc:
-        print(f"[state] erro ao consultar {media_type} recente: {exc!r}")
-        return False
-
-async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
-    return await _has_recent_generic(session, user_id, "menu", minutes)
-
-async def _has_recent_video(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
-    return await _has_recent_generic(session, user_id, "video", minutes)
-
-async def _has_recent_handoff(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
-    return await _has_recent_generic(session, user_id, "handoff", minutes)
-
 def _is_positive_reply(text: Optional[str]) -> bool:
+    """
+    Reconhece respostas positivas vindas de button id ou do próprio texto do usuário.
+    """
     if not text:
         return False
     t = _normalize(text)
-    if t in {_normalize(LUNA_MENU_YES), "sim"}:
+    tokens = {
+        "sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim",
+        "pode continuar", "continuar", "aceito", "aceitar", "vamos",
+        "bora", "manda", "mande", "envia", "enviar", "segue", "segue sim",
+        "quero", "tenho interesse", "interessa", "top", "show", "positivo",
+        "agora", "mais tarde", "sim pode",
+        # ids comuns de botões
+        "yes", "y", "1"
+    }
+    if t in tokens or t == _normalize(LUNA_MENU_YES):
         return True
     if any(e in text for e in _POSITIVE_EMOJIS):
         return True
-    if t in _POSITIVE_WORDS:
-        return True
-    if "pode" in t or "mostrar" in t or "enviar" in t or "manda" in t:
+    # gatilhos por substring
+    if any(s in t for s in ("pode", "continuar", "mostrar", "enviar", "manda", "sim", "yes")):
         return True
     if "video" in t or "vídeo" in t:
         return True
@@ -377,21 +349,20 @@ def _parse_tools_from_tags(reply_text: str) -> set:
     tools: set = set()
     if not reply_text:
         return tools
-    m = _TOOL_TAG_RE.search(reply_text)
-    if not m:
-        return tools
-    content = m.group(1) or ""
-    parts = re.split(r"[,\s]+", content)
-    for p in parts:
-        p = p.strip().lower()
-        if not p:
-            continue
-        if p in {"enviar_caixinha_interesse", "menu", "caixinha"}:
-            tools.add("menu")
-        elif p in {"enviar_video", "video", "vídeo"}:
-            tools.add("video")
-        elif p in {"enviar_msg", "handoff", "transfer"}:
-            tools.add("handoff")
+    # pega TODAS as ocorrências
+    for m in _TOOL_TAG_RE.findall(reply_text):
+        content = m or ""
+        parts = re.split(r"[,\s]+", content)
+        for p in parts:
+            p = (p or "").strip().lower()
+            if not p:
+                continue
+            if p in {"enviar_caixinha_interesse", "menu", "caixinha"}:
+                tools.add("menu")
+            elif p in {"enviar_video", "video", "vídeo"}:
+                tools.add("video")
+            elif p in {"enviar_msg", "handoff", "transfer"}:
+                tools.add("handoff")
     return tools
 
 def _looks_like_handoff(reply_text: str) -> bool:
@@ -418,8 +389,8 @@ def _looks_like_handoff(reply_text: str) -> bool:
 
 def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool, bool]:
     tags = _parse_tools_from_tags(reply_text)
-    wants_menu = ("menu" in tags) or ("enviar_caixinha_interesse" in reply_text.lower()) or _looks_like_invite(reply_text)
-    wants_video = ("video" in tags) or ("enviar_video" in reply_text.lower())
+    wants_menu = ("menu" in tags) or ("enviar_caixinha_interesse" in (reply_text or "").lower()) or _looks_like_invite(reply_text)
+    wants_video = ("video" in tags) or ("enviar_video" in (reply_text or "").lower())
     wants_handoff = ("handoff" in tags) or _looks_like_handoff(reply_text)
     return (wants_menu, wants_video, wants_handoff)
 
@@ -454,7 +425,6 @@ def _build_handoff_text(user: User, phone: str, last_msg: Optional[str]) -> str:
     wa_link = f"https://wa.me/{digits}" if digits else ""
 
     tpl = HANDOFF_NOTIFY_TEMPLATE
-    # Formatação segura: se houver placeholder desconhecido, não quebra
     try:
         return tpl.format(name=name, digits=digits, last=last, wa_link=wa_link)
     except Exception as exc:
@@ -477,7 +447,6 @@ async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, 
             await send_whatsapp_message(phone=t, content=alert, type_="text")
         except Exception as e:
             print(f"[handoff] falha ao notificar {t}: {e!r}")
-    # registra para anti-duplicação
     session.add(Message(user_id=user.id, sender="assistant", content=alert, media_type="handoff"))
     await session.commit()
 
@@ -610,10 +579,15 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     await _enviar_video(session, phone, user)
                     return
 
-                # 1.e) Anti-eco (convite) após caixinha
+                # 1.e) Anti-eco (convite) após caixinha — NUNCA ficar silencioso
                 if menu_recent and _looks_like_invite(reply_text):
-                    print("[guard] menu enviado há pouco; suprimindo texto convite duplicado.")
-                    return
+                    # Preferência: se ainda não enviou vídeo, avance com o vídeo (quando fizer sentido)
+                    if not video_recent and (_is_positive_reply(text) or not LUNA_STRICT_ASSISTANT):
+                        await _enviar_video(session, phone, user)
+                        return
+                    # Caso contrário, manda uma confirmação curta (evita repetir convite)
+                    reply_text = "Perfeito — vamos avançar. Para te ajudar melhor, me diga o objetivo do vídeo."
+                    # e segue para envio do texto abaixo
 
                 # 1.f) Texto normal para o lead
                 try:
