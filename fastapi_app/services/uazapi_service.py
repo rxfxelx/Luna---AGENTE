@@ -141,7 +141,7 @@ async def send_whatsapp_message(
         # ===================== TEXT =====================
         if type_ == "text" or not media_url:
             for endpoint in _text_endpoints():
-                # Diversas variações de payload aceitas em instalações diferentes
+                # Variações aceitas em instalações diferentes
                 if endpoint == "/send/text":
                     candidates: List[Dict[str, Any]] = [
                         {"number": digits, "text": content},
@@ -208,7 +208,6 @@ async def send_whatsapp_message(
                         except Exception:
                             return {"status": "ok", "http_status": resp.status_code}
                     else:
-                        # se o servidor reclamar de 'missing file field', vamos para multipart
                         print(f"[uazapi] {endpoint} JSON {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
                 except Exception as exc:
                     print(f"[uazapi] exception on {endpoint} JSON payload={list(payload.keys())}: {exc}")
