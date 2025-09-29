@@ -47,8 +47,10 @@ def _env_template(key: str, default: str = "") -> str:
     raw = os.getenv(key, default) or ""
     raw = raw.strip()
     raw = re.sub(r'^\s*HANDOFF_NOTIFY_TEMPLATE\s*=\s*', '', raw, flags=re.I)
+    # tira aspas de borda se houver
     if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
         raw = raw[1:-1]
+    # normaliza escapes
     raw = raw.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
     return raw
 
@@ -103,22 +105,26 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
 
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
-# ⚠️ IMPORTANTE: colocar os campos de BOTÃO antes dos textos longos,
-# para capturarmos "Sim, pode continuar" e não o corpo da caixinha.
-TEXT_KEYS_PRIORITY = (
-    # respostas de botões/listas (variações) — PRIORIDADE MÁXIMA
-    "messages.0.message.templateButtonReplyMessage.selectedDisplayText",
-    "messages.0.message.buttonsResponseMessage.selectedButtonId",
-    "messages.0.message.listResponseMessage.title",
-    "data.data.messages.0.message.buttonsResponseMessage.selectedButtonId",
+# 1) SEMPRE priorize campos de resposta de botão/lista (display do clique)
+BUTTON_KEYS_PRIORITY = (
     "data.data.messages.0.message.templateButtonReplyMessage.selectedDisplayText",
+    "messages.0.message.templateButtonReplyMessage.selectedDisplayText",
+    "data.data.messages.0.message.listResponseMessage.title",
+    "messages.0.message.listResponseMessage.title",
+    # Ids (quando não vem display text):
+    "data.data.messages.0.message.buttonsResponseMessage.selectedButtonId",
+    "messages.0.message.buttonsResponseMessage.selectedButtonId",
+    "data.data.messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
+    "messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
+)
 
+# 2) Demais fontes de texto (só se não for clique de botão/lista)
+TEXT_KEYS_PRIORITY = (
     # Baileys-like / variados
-    "data.data.messages.0.message.conversation",
     "data.data.messages.0.message.extendedTextMessage.text",
-    "messages.0.message.conversation",
     "messages.0.message.extendedTextMessage.text",
-
+    "data.data.messages.0.message.conversation",
+    "messages.0.message.conversation",
     # Uazapi simples
     "messages.0.text",
     "data.text",
@@ -129,6 +135,9 @@ TEXT_KEYS_PRIORITY = (
     "body",
     "content",
     "caption",
+    # (redundância de segurança – se algum lib mandar esses campos aqui)
+    "data.data.messages.0.message.buttonsResponseMessage.selectedButtonId",
+    "data.data.messages.0.message.templateButtonReplyMessage.selectedDisplayText",
 )
 
 def _only_digits(s: str) -> str:
@@ -196,11 +205,44 @@ def _scan_for_phone(obj: Any) -> Optional[str]:
     walk(obj)
     return _only_digits(found_plain) if found_plain else None
 
+def _extract_menu_choice(event: Dict[str, Any]) -> Optional[str]:
+    """Tenta extrair o DISPLAY do clique em botão/lista (ou o ID, mapeando)."""
+    for path in BUTTON_KEYS_PRIORITY:
+        val = _deep_get(event, path)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    # Varredura genérica em caso de libs exóticas
+    wanted_keys = {"selecteddisplaytext", "selectedbuttonid", "title", "selectedrowid"}
+    def walk(x: Any) -> Optional[str]:
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if isinstance(v, str) and v.strip() and k.lower() in wanted_keys:
+                    return v.strip()
+                r = walk(v)
+                if r:
+                    return r
+        elif isinstance(x, list):
+            for v in x:
+                r = walk(v)
+                if r:
+                    return r
+        return None
+    return walk(event)
+
 def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
+    # 1) Primeiro: clique de botão/lista
+    choice = _extract_menu_choice(event)
+    if choice:
+        return choice
+
+    # 2) Depois: textos em geral
     for path in TEXT_KEYS_PRIORITY:
         val = _deep_get(event, path)
         if isinstance(val, str) and val.strip():
             return val.strip()
+
+    # 3) Busca heurística
     keys = {"text", "message", "body", "content", "caption", "conversation", "title"}
     found: Optional[str] = None
     def walk(x: Any):
@@ -347,9 +389,6 @@ def _is_positive_reply(text: Optional[str]) -> bool:
     t = _normalize(text)
     if t in {_normalize(LUNA_MENU_YES), "sim"}:
         return True
-    # novo: aceitar 'sim' como substring (caso venha a caixinha inteira junto)
-    if "sim" in t:
-        return True
     if any(e in text for e in _POSITIVE_EMOJIS):
         return True
     if t in _POSITIVE_WORDS:
@@ -462,6 +501,7 @@ def _build_handoff_text(user: User, phone: str, last_msg: Optional[str]) -> str:
     name = (user.name or "").strip() or "—"
     last = (last_msg or "").strip() or "—"
     wa_link = f"https://wa.me/{digits}" if digits else ""
+
     tpl = HANDOFF_NOTIFY_TEMPLATE
     try:
         return tpl.format(name=name, digits=digits, last=last, wa_link=wa_link)
@@ -569,16 +609,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
             video_recent   = await _has_recent_video(session, user.id, minutes=30)
             handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)
 
-            print(f"[flow] state menu_recent={menu_recent} video_recent={video_recent} handoff_recent={handoff_recent} text='{(text or '')[:80]}'")
-
-            # ---------- Fallback IMEDIATO pós-caixinha (se não-estrito) ----------
-            if not LUNA_STRICT_ASSISTANT and msg_type == "text" and text and menu_recent and not video_recent:
-                if _is_positive_reply(text):
-                    print("[flow] fallback positivo pós-caixinha => enviar vídeo agora.")
-                    await _enviar_video(session, phone, user)
-                    return
-
-            # 1) Texto -> consulta IA (sempre), com CONTEXTO + PHONE
+            # 1) Texto -> consulta IA (sempre), com CONTEXTO do estado + PHONE
             if msg_type == "text" and text:
                 thread_id = await get_or_create_thread(session, user)
 
@@ -587,8 +618,10 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
                 prefix = ""
                 if video_recent:
-                    prefix = ("Contexto: o lead acabou de receber o vídeo demonstrativo da Verbo Vídeo. "
-                              "Prossiga com a etapa seguinte do fluxo (pós-vídeo). Mensagem do lead: ")
+                    prefix = (
+                        "Contexto: o lead acabou de receber o vídeo demonstrativo da Verbo Vídeo. "
+                        "Prossiga com a etapa seguinte do fluxo (pós-vídeo). Mensagem do lead: "
+                    )
                 elif menu_recent:
                     tnorm = _normalize(text)
                     if tnorm in {_normalize(LUNA_MENU_YES), "sim"} or "sim" in tnorm:
@@ -600,14 +633,11 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
                 ai_input = (meta_phone + prefix + (text or "")).strip()
                 reply_text = await ask_assistant(thread_id, ai_input) or ""
-                print(f"[ai] reply len={len(reply_text)} preview='{reply_text[:80].replace(chr(10),' ')}'")
 
                 wants_menu, wants_video, wants_handoff = _parse_tool_hints(reply_text)
-                print(f"[ai] wants menu={wants_menu} video={wants_video} handoff={wants_handoff}")
 
                 # 1.a) Se a IA pediu caixinha/convite
                 if (wants_menu or _looks_like_invite(reply_text)) and not menu_recent:
-                    print("[flow] IA pediu menu => enviar.")
                     await _enviar_menu(session, phone, user)
                     return
                 if (wants_menu or _looks_like_invite(reply_text)) and menu_recent:
@@ -615,7 +645,6 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
                 # 1.b) Se a IA pediu VÍDEO
                 if wants_video and not video_recent:
-                    print("[flow] IA pediu vídeo => enviar.")
                     await _enviar_video(session, phone, user)
                     return
                 if wants_video and video_recent:
@@ -623,15 +652,21 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
                 # 1.c) HANDOFF: notificar consultores (uma vez por janela)
                 if wants_handoff and not handoff_recent:
-                    print("[flow] IA sinalizou handoff => notificar consultores.")
                     await _notify_consultants(session, user=user, phone=phone, user_text=text)
+                    # segue respondendo ao lead com o próprio reply_text da IA
 
-                # 1.d) Anti-eco (convite) após caixinha
+                # 1.d) Fallback opcional — vídeo após SIM na caixinha (se IA não mandou)
+                if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
+                    print("[fallback] SIM na caixinha reconhecido; enviando vídeo.")
+                    await _enviar_video(session, phone, user)
+                    return
+
+                # 1.e) Anti-eco (convite) após caixinha
                 if menu_recent and _looks_like_invite(reply_text):
                     print("[guard] menu enviado há pouco; suprimindo texto convite duplicado.")
                     return
 
-                # 1.e) Texto normal para o lead (SEM as tags #tools(...))
+                # 1.f) Texto normal para o lead (SEM as tags #tools(...))
                 clean_text = _strip_tool_tags(reply_text) or "Certo!"
                 try:
                     await send_whatsapp_message(phone=phone, content=clean_text, type_="text")
