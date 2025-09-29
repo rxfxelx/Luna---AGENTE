@@ -3,12 +3,14 @@
 Webhook e endpoints para WhatsApp (Uazapi).
 
 Fluxo resumido:
-- Encaminha TODO texto do lead para a IA (Assistant), com contexto do estado (caixinha/vídeo) + phone do lead.
+- Encaminha texto do lead para a IA (Assistant) COM contexto de estado (caixinha/vídeo) + phone do lead.
 - Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints por texto ou por tag #tools()).
+- Atalho local: após a caixinha, interpreta SIM/NÃO sem chamar a IA (responde na hora).
 - Fallback opcional: vídeo após SIM na caixinha (configurável).
 - Handoff: quando a IA sinaliza (função/texto), notifica consultores em outro chat.
 - Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -31,6 +33,7 @@ from ..services.uazapi_service import send_whatsapp_message, send_menu_interesse
 router = APIRouter(tags=["whatsapp-webhook"])
 
 # =========================== ENV & helpers ===========================
+
 def _env_str(key: str, default: str = "") -> str:
     # remove aspas e espaços extras vindos do painel (Railway etc.)
     return (os.getenv(key, default) or "").strip().strip('"').strip("'")
@@ -75,6 +78,7 @@ HANDOFF_NOTIFY_TEMPLATE = _env_template(
 )
 
 # --------------------------- Auth helpers ---------------------------
+
 def _env_token() -> str:
     token = os.getenv("WEBHOOK_VERIFY_TOKEN", "")
     if not token:
@@ -99,6 +103,7 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Invalid webhook token")
 
 # --------------------------- Payload helpers ---------------------------
+
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
 TEXT_KEYS_PRIORITY = (
@@ -296,12 +301,14 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     return {"phone": phone, "msg_type": msg_type, "text": text}
 
 # --------------------------- Fluxo helpers ---------------------------
+
 _POSITIVE_WORDS = {
     "sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim", "pode continuar",
     "vamos", "bora", "manda", "mande", "envia", "enviar", "segue", "segue sim",
     "quero", "tenho interesse", "interessa", "top", "show", "positivo", "agora",
     "mais tarde", "sim pode", "pode mandar", "pode enviar", "pode mostrar",
 }
+_NEGATIVE_WORDS = {"nao", "não", "nao obrigado", "não obrigado", "pode encerrar", "parar", "cancelar", "encerre"}
 _POSITIVE_EMOJIS = {"👍", "👌", "✅", "✔️", "✌️", "🤝"}
 
 async def _has_recent_generic(session: AsyncSession, user_id: int, media_type: str, minutes: int) -> bool:
@@ -340,13 +347,27 @@ def _is_positive_reply(text: Optional[str]) -> bool:
     t = _normalize(text)
     if t in {_normalize(LUNA_MENU_YES), "sim"}:
         return True
-    if any(e in text for e in _POSITIVE_EMOJIS):
-        return True
     if t in _POSITIVE_WORDS:
         return True
-    if "pode" in t or "mostrar" in t or "enviar" in t or "manda" in t:
+    if any(e in text for e in _POSITIVE_EMOJIS):
         return True
     if "video" in t or "vídeo" in t:
+        return True
+    # alguns provedores retornam "0" para 1º botão (SIM)
+    if t in {"0", "1"}:
+        # assume "0"=sim "1"=não (ordem usual)
+        return t == "0"
+    return False
+
+def _is_negative_reply(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    t = _normalize(text)
+    if t in {_normalize(LUNA_MENU_NO), "nao", "não"}:
+        return True
+    if t in _NEGATIVE_WORDS:
+        return True
+    if t in {"1"}:  # ver comentário acima
         return True
     return False
 
@@ -365,6 +386,7 @@ def _looks_like_invite(reply_text: str) -> bool:
     return any(p in t for p in _INVITE_PATTERNS)
 
 # --------- IA tool-hints (tags e linguagem natural) ---------
+
 _TOOL_TAG_RE = re.compile(r"#tools?\s*\(\s*([^)]+)\)", re.I)
 
 def _strip_tool_tags(text: Optional[str]) -> str:
@@ -423,6 +445,7 @@ def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool, bool]:
     return (wants_menu, wants_video, wants_handoff)
 
 # --------- Handoff helpers ---------
+
 def _parse_notify_numbers(raw: str) -> List[str]:
     nums: List[str] = []
     for token in re.split(r"[,\s;]+", raw or ""):
@@ -478,6 +501,7 @@ async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, 
     await session.commit()
 
 # --------- Ações de saída ---------
+
 async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
     if not LUNA_MENU_TEXT:
         print("[menu] LUNA_MENU_TEXT não definido; caixinha foi pulada.")
@@ -501,7 +525,6 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
         await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
         return
     try:
-        # 1) tenta envio nativo (JSON por URL + multipart) via uazapi_service
         await send_whatsapp_message(
             phone=phone,
             content=LUNA_VIDEO_CAPTION or "",
@@ -512,14 +535,12 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
         session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_URL, media_type="video"))
         await session.commit()
         print("[video] enviado com sucesso.")
-
         if LUNA_VIDEO_AFTER_TEXT:
             await send_whatsapp_message(phone=phone, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
             session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_AFTER_TEXT, media_type="text"))
             await session.commit()
-
     except Exception as exc:
-        # 2) fallback duro: manda link em texto para não travar a conversa
+        # fallback duro: manda link em texto
         print(f"[video] falha ao enviar vídeo nativo: {exc!r} — enviando link em texto.")
         fallback_text = (LUNA_VIDEO_CAPTION + "\n" if LUNA_VIDEO_CAPTION else "") + f"{LUNA_VIDEO_URL}"
         try:
@@ -528,7 +549,6 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
             print(f"[video] fallback textual também falhou: {e2!r}")
         session.add(Message(user_id=user.id, sender="assistant", content=fallback_text, media_type="text"))
         await session.commit()
-
         if LUNA_VIDEO_AFTER_TEXT:
             try:
                 await send_whatsapp_message(phone=phone, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
@@ -576,7 +596,22 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
             video_recent   = await _has_recent_video(session, user.id, minutes=30)
             handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)
 
-            # 1) Texto -> consulta IA (sempre), com CONTEXTO do estado + PHONE
+            # 0) Se houve caixinha recente, trate SIM/NÃO localmente (sem IA).
+            if msg_type == "text" and text and menu_recent:
+                if _is_positive_reply(text):
+                    await _enviar_video(session, phone, user)
+                    return
+                if _is_negative_reply(text):
+                    end_text = LUNA_END_TEXT or "Tudo bem! Se precisar depois, estou por aqui. 🌟"
+                    try:
+                        await send_whatsapp_message(phone=phone, content=end_text, type_="text")
+                    except Exception as e:
+                        print(f"[uazapi] send end_text failed (bg): {e!r}")
+                    session.add(Message(user_id=user.id, sender="assistant", content=end_text, media_type="text"))
+                    await session.commit()
+                    return
+
+            # 1) Texto -> consulta IA (com CONTEXTO do estado + PHONE)
             if msg_type == "text" and text:
                 thread_id = await get_or_create_thread(session, user)
 
