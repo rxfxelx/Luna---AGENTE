@@ -13,6 +13,7 @@ Fluxo resumido:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import unicodedata
@@ -105,26 +106,12 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
 
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
-# 1) SEMPRE priorize campos de resposta de botão/lista (display do clique)
-BUTTON_KEYS_PRIORITY = (
-    "data.data.messages.0.message.templateButtonReplyMessage.selectedDisplayText",
-    "messages.0.message.templateButtonReplyMessage.selectedDisplayText",
-    "data.data.messages.0.message.listResponseMessage.title",
-    "messages.0.message.listResponseMessage.title",
-    # Ids (quando não vem display text):
-    "data.data.messages.0.message.buttonsResponseMessage.selectedButtonId",
-    "messages.0.message.buttonsResponseMessage.selectedButtonId",
-    "data.data.messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
-    "messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
-)
-
-# 2) Demais fontes de texto (só se não for clique de botão/lista)
 TEXT_KEYS_PRIORITY = (
     # Baileys-like / variados
-    "data.data.messages.0.message.extendedTextMessage.text",
-    "messages.0.message.extendedTextMessage.text",
     "data.data.messages.0.message.conversation",
+    "data.data.messages.0.message.extendedTextMessage.text",
     "messages.0.message.conversation",
+    "messages.0.message.extendedTextMessage.text",
     # Uazapi simples
     "messages.0.text",
     "data.text",
@@ -135,9 +122,16 @@ TEXT_KEYS_PRIORITY = (
     "body",
     "content",
     "caption",
-    # (redundância de segurança – se algum lib mandar esses campos aqui)
+    # respostas de botões/listas (variações comuns)
+    "messages.0.message.templateButtonReplyMessage.selectedDisplayText",
+    "messages.0.message.buttonsResponseMessage.selectedButtonId",
+    "messages.0.message.buttonsResponseMessage.selectedDisplayText",
+    "messages.0.message.listResponseMessage.title",
     "data.data.messages.0.message.buttonsResponseMessage.selectedButtonId",
     "data.data.messages.0.message.templateButtonReplyMessage.selectedDisplayText",
+    # interativos recentes
+    "messages.0.message.interactiveResponseMessage.nativeFlowResponseMessage.paramsJson",
+    "data.data.messages.0.message.interactiveResponseMessage.nativeFlowResponseMessage.paramsJson",
 )
 
 def _only_digits(s: str) -> str:
@@ -205,73 +199,126 @@ def _scan_for_phone(obj: Any) -> Optional[str]:
     walk(obj)
     return _only_digits(found_plain) if found_plain else None
 
-def _extract_menu_choice(event: Dict[str, Any]) -> Optional[str]:
-    """Tenta extrair o DISPLAY do clique em botão/lista (ou o ID, mapeando)."""
-    for path in BUTTON_KEYS_PRIORITY:
-        val = _deep_get(event, path)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-
-    # Varredura genérica em caso de libs exóticas
-    wanted_keys = {"selecteddisplaytext", "selectedbuttonid", "title", "selectedrowid"}
-    def walk(x: Any) -> Optional[str]:
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if isinstance(v, str) and v.strip() and k.lower() in wanted_keys:
-                    return v.strip()
-                r = walk(v)
-                if r:
-                    return r
-        elif isinstance(x, list):
-            for v in x:
-                r = walk(v)
-                if r:
-                    return r
+def _parse_interactive_params_json(val: Any) -> Optional[str]:
+    """
+    Alguns provedores mandam interactiveResponseMessage.nativeFlowResponseMessage.paramsJson
+    como string JSON. Aqui tentamos extrair título/ID selecionado.
+    """
+    if not isinstance(val, str) or not val.strip():
         return None
-    return walk(event)
+    try:
+        data = json.loads(val)
+    except Exception:
+        return None
+    # heurística: procura campos comuns
+    for k in ("title", "text", "id", "selected_text", "selectedTitle"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # às vezes vem como lista de objetos
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, dict):
+                for kk in ("title", "text"):
+                    vv = v.get(kk)
+                    if isinstance(vv, str) and vv.strip():
+                        return vv.strip()
+    return None
 
 def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
-    # 1) Primeiro: clique de botão/lista
-    choice = _extract_menu_choice(event)
-    if choice:
-        return choice
-
-    # 2) Depois: textos em geral
+    # 1) caminhos mais prováveis
     for path in TEXT_KEYS_PRIORITY:
         val = _deep_get(event, path)
         if isinstance(val, str) and val.strip():
+            # caso especial: paramsJson
+            if path.endswith("paramsJson"):
+                parsed = _parse_interactive_params_json(val)
+                if parsed:
+                    return parsed
             return val.strip()
 
-    # 3) Busca heurística
-    keys = {"text", "message", "body", "content", "caption", "conversation", "title"}
+    # 2) varredura focada em estruturas de botão/lista
+    keys_like = {
+        "selecteddisplaytext", "selectedbuttonid", "selectedid", "buttontext",
+        "replytext", "displaytext", "title", "text", "reply", "singleSelectReply"
+    }
     found: Optional[str] = None
-    def walk(x: Any):
+
+    def walk_buttons(x: Any):
         nonlocal found
         if found:
             return
         if isinstance(x, dict):
             for k, v in x.items():
-                if isinstance(v, str) and k.lower() in keys and v.strip():
+                kl = str(k).lower()
+                if isinstance(v, str) and kl in keys_like and v.strip():
                     found = v.strip()
                     return
-                walk(v)
+                # estruturas nested conhecidas
+                if kl in {"button", "buttonresponsemessage", "templatereplymessage",
+                          "buttonsresponsemessage", "listresponsemessage",
+                          "interactiveresponsemessage"} and isinstance(v, dict):
+                    # dentro pode existir displayText/title
+                    for kk in ("selectedDisplayText", "displayText", "title", "text", "selectedId", "selectedRowId"):
+                        vv = v.get(kk)
+                        if isinstance(vv, str) and vv.strip():
+                            found = vv.strip()
+                            return
+                walk_buttons(v)
         elif isinstance(x, list):
             for v in x:
-                walk(v)
-    walk(event)
+                walk_buttons(v)
+
+    walk_buttons(event)
+    if found:
+        return found
+
+    # 3) fallback genérico (texto/caption/body/content/title/conversation)
+    generic_keys = {"text", "message", "body", "content", "caption", "conversation", "title"}
+    def walk_generic(x: Any):
+        nonlocal found
+        if found:
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if isinstance(v, str) and k.lower() in generic_keys and v.strip():
+                    found = v.strip()
+                    return
+                walk_generic(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk_generic(v)
+    walk_generic(event)
     return found
 
+def _is_truthy_bool_like(v: Any) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        vl = v.strip().lower()
+        if vl in {"true", "1", "yes"}:
+            return True
+        if vl in {"false", "0", "no"}:
+            return False
+    return None
+
 def _is_from_me(event: Dict[str, Any]) -> bool:
+    # Checa múltiplos caminhos e interpreta bool/str
     for path in (
         "data.data.messages.0.key.fromMe",
         "messages.0.key.fromMe",
         "fromMe",
         "data.fromMe",
         "message.fromMe",
+        "messages.0.fromMe",
     ):
         v = _deep_get(event, path)
-        if isinstance(v, bool) and v:
+        vb = _is_truthy_bool_like(v)
+        if vb is True:
             return True
+        if vb is False:
+            return False
+    # fallback conservador: se não souber, considera "não é meu"
     return False
 
 def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
@@ -389,7 +436,7 @@ def _is_positive_reply(text: Optional[str]) -> bool:
     t = _normalize(text)
     if t in {_normalize(LUNA_MENU_YES), "sim"}:
         return True
-    if any(e in text for e in _POSITIVE_EMOJIS):
+    if any(e in (text or "") for e in _POSITIVE_EMOJIS):
         return True
     if t in _POSITIVE_WORDS:
         return True
@@ -657,7 +704,6 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
                 # 1.d) Fallback opcional — vídeo após SIM na caixinha (se IA não mandou)
                 if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
-                    print("[fallback] SIM na caixinha reconhecido; enviando vídeo.")
                     await _enviar_video(session, phone, user)
                     return
 
@@ -704,6 +750,7 @@ async def webhook_post(
     except Exception:
         return JSONResponse({"received": False, "reason": "invalid JSON"}, status_code=200)
 
+    # Ignora mensagens que foram enviadas por nós (da conta do bot)
     if _is_from_me(payload):
         return JSONResponse({"received": True, "note": "from_me"}, status_code=200)
 
