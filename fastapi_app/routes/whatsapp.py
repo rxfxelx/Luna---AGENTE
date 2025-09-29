@@ -9,11 +9,9 @@ Fluxo resumido:
 - Handoff: quando a IA sinaliza (função/texto), notifica consultores em outro chat.
 - Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações.
 """
-
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import unicodedata
@@ -33,7 +31,6 @@ from ..services.uazapi_service import send_whatsapp_message, send_menu_interesse
 router = APIRouter(tags=["whatsapp-webhook"])
 
 # =========================== ENV & helpers ===========================
-
 def _env_str(key: str, default: str = "") -> str:
     # remove aspas e espaços extras vindos do painel (Railway etc.)
     return (os.getenv(key, default) or "").strip().strip('"').strip("'")
@@ -78,7 +75,6 @@ HANDOFF_NOTIFY_TEMPLATE = _env_template(
 )
 
 # --------------------------- Auth helpers ---------------------------
-
 def _env_token() -> str:
     token = os.getenv("WEBHOOK_VERIFY_TOKEN", "")
     if not token:
@@ -103,7 +99,6 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Invalid webhook token")
 
 # --------------------------- Payload helpers ---------------------------
-
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
 TEXT_KEYS_PRIORITY = (
@@ -122,16 +117,12 @@ TEXT_KEYS_PRIORITY = (
     "body",
     "content",
     "caption",
-    # respostas de botões/listas (variações comuns)
+    # respostas de botões/listas (variações)
     "messages.0.message.templateButtonReplyMessage.selectedDisplayText",
     "messages.0.message.buttonsResponseMessage.selectedButtonId",
-    "messages.0.message.buttonsResponseMessage.selectedDisplayText",
     "messages.0.message.listResponseMessage.title",
     "data.data.messages.0.message.buttonsResponseMessage.selectedButtonId",
     "data.data.messages.0.message.templateButtonReplyMessage.selectedDisplayText",
-    # interativos recentes
-    "messages.0.message.interactiveResponseMessage.nativeFlowResponseMessage.paramsJson",
-    "data.data.messages.0.message.interactiveResponseMessage.nativeFlowResponseMessage.paramsJson",
 )
 
 def _only_digits(s: str) -> str:
@@ -199,126 +190,40 @@ def _scan_for_phone(obj: Any) -> Optional[str]:
     walk(obj)
     return _only_digits(found_plain) if found_plain else None
 
-def _parse_interactive_params_json(val: Any) -> Optional[str]:
-    """
-    Alguns provedores mandam interactiveResponseMessage.nativeFlowResponseMessage.paramsJson
-    como string JSON. Aqui tentamos extrair título/ID selecionado.
-    """
-    if not isinstance(val, str) or not val.strip():
-        return None
-    try:
-        data = json.loads(val)
-    except Exception:
-        return None
-    # heurística: procura campos comuns
-    for k in ("title", "text", "id", "selected_text", "selectedTitle"):
-        v = data.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    # às vezes vem como lista de objetos
-    if isinstance(data, dict):
-        for v in data.values():
-            if isinstance(v, dict):
-                for kk in ("title", "text"):
-                    vv = v.get(kk)
-                    if isinstance(vv, str) and vv.strip():
-                        return vv.strip()
-    return None
-
 def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
-    # 1) caminhos mais prováveis
     for path in TEXT_KEYS_PRIORITY:
         val = _deep_get(event, path)
         if isinstance(val, str) and val.strip():
-            # caso especial: paramsJson
-            if path.endswith("paramsJson"):
-                parsed = _parse_interactive_params_json(val)
-                if parsed:
-                    return parsed
             return val.strip()
-
-    # 2) varredura focada em estruturas de botão/lista
-    keys_like = {
-        "selecteddisplaytext", "selectedbuttonid", "selectedid", "buttontext",
-        "replytext", "displaytext", "title", "text", "reply", "singleSelectReply"
-    }
+    keys = {"text", "message", "body", "content", "caption", "conversation", "title"}
     found: Optional[str] = None
-
-    def walk_buttons(x: Any):
+    def walk(x: Any):
         nonlocal found
         if found:
             return
         if isinstance(x, dict):
             for k, v in x.items():
-                kl = str(k).lower()
-                if isinstance(v, str) and kl in keys_like and v.strip():
+                if isinstance(v, str) and k.lower() in keys and v.strip():
                     found = v.strip()
                     return
-                # estruturas nested conhecidas
-                if kl in {"button", "buttonresponsemessage", "templatereplymessage",
-                          "buttonsresponsemessage", "listresponsemessage",
-                          "interactiveresponsemessage"} and isinstance(v, dict):
-                    # dentro pode existir displayText/title
-                    for kk in ("selectedDisplayText", "displayText", "title", "text", "selectedId", "selectedRowId"):
-                        vv = v.get(kk)
-                        if isinstance(vv, str) and vv.strip():
-                            found = vv.strip()
-                            return
-                walk_buttons(v)
+                walk(v)
         elif isinstance(x, list):
             for v in x:
-                walk_buttons(v)
-
-    walk_buttons(event)
-    if found:
-        return found
-
-    # 3) fallback genérico (texto/caption/body/content/title/conversation)
-    generic_keys = {"text", "message", "body", "content", "caption", "conversation", "title"}
-    def walk_generic(x: Any):
-        nonlocal found
-        if found:
-            return
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if isinstance(v, str) and k.lower() in generic_keys and v.strip():
-                    found = v.strip()
-                    return
-                walk_generic(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk_generic(v)
-    walk_generic(event)
+                walk(v)
+    walk(event)
     return found
 
-def _is_truthy_bool_like(v: Any) -> Optional[bool]:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str):
-        vl = v.strip().lower()
-        if vl in {"true", "1", "yes"}:
-            return True
-        if vl in {"false", "0", "no"}:
-            return False
-    return None
-
 def _is_from_me(event: Dict[str, Any]) -> bool:
-    # Checa múltiplos caminhos e interpreta bool/str
     for path in (
         "data.data.messages.0.key.fromMe",
         "messages.0.key.fromMe",
         "fromMe",
         "data.fromMe",
         "message.fromMe",
-        "messages.0.fromMe",
     ):
         v = _deep_get(event, path)
-        vb = _is_truthy_bool_like(v)
-        if vb is True:
+        if isinstance(v, bool) and v:
             return True
-        if vb is False:
-            return False
-    # fallback conservador: se não souber, considera "não é meu"
     return False
 
 def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
@@ -391,7 +296,6 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
     return {"phone": phone, "msg_type": msg_type, "text": text}
 
 # --------------------------- Fluxo helpers ---------------------------
-
 _POSITIVE_WORDS = {
     "sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim", "pode continuar",
     "vamos", "bora", "manda", "mande", "envia", "enviar", "segue", "segue sim",
@@ -436,7 +340,7 @@ def _is_positive_reply(text: Optional[str]) -> bool:
     t = _normalize(text)
     if t in {_normalize(LUNA_MENU_YES), "sim"}:
         return True
-    if any(e in (text or "") for e in _POSITIVE_EMOJIS):
+    if any(e in text for e in _POSITIVE_EMOJIS):
         return True
     if t in _POSITIVE_WORDS:
         return True
@@ -461,7 +365,6 @@ def _looks_like_invite(reply_text: str) -> bool:
     return any(p in t for p in _INVITE_PATTERNS)
 
 # --------- IA tool-hints (tags e linguagem natural) ---------
-
 _TOOL_TAG_RE = re.compile(r"#tools?\s*\(\s*([^)]+)\)", re.I)
 
 def _strip_tool_tags(text: Optional[str]) -> str:
@@ -520,7 +423,6 @@ def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool, bool]:
     return (wants_menu, wants_video, wants_handoff)
 
 # --------- Handoff helpers ---------
-
 def _parse_notify_numbers(raw: str) -> List[str]:
     nums: List[str] = []
     for token in re.split(r"[,\s;]+", raw or ""):
@@ -576,7 +478,6 @@ async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, 
     await session.commit()
 
 # --------- Ações de saída ---------
-
 async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
     if not LUNA_MENU_TEXT:
         print("[menu] LUNA_MENU_TEXT não definido; caixinha foi pulada.")
@@ -600,6 +501,7 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
         await send_whatsapp_message(phone=phone, content="Desculpe, não consigo mostrar vídeos no momento.", type_="text")
         return
     try:
+        # 1) tenta envio nativo (JSON por URL + multipart) via uazapi_service
         await send_whatsapp_message(
             phone=phone,
             content=LUNA_VIDEO_CAPTION or "",
@@ -610,12 +512,30 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
         session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_URL, media_type="video"))
         await session.commit()
         print("[video] enviado com sucesso.")
+
         if LUNA_VIDEO_AFTER_TEXT:
             await send_whatsapp_message(phone=phone, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
             session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_AFTER_TEXT, media_type="text"))
             await session.commit()
+
     except Exception as exc:
-        print(f"[video] falha ao enviar vídeo: {exc!r}")
+        # 2) fallback duro: manda link em texto para não travar a conversa
+        print(f"[video] falha ao enviar vídeo nativo: {exc!r} — enviando link em texto.")
+        fallback_text = (LUNA_VIDEO_CAPTION + "\n" if LUNA_VIDEO_CAPTION else "") + f"{LUNA_VIDEO_URL}"
+        try:
+            await send_whatsapp_message(phone=phone, content=fallback_text, type_="text")
+        except Exception as e2:
+            print(f"[video] fallback textual também falhou: {e2!r}")
+        session.add(Message(user_id=user.id, sender="assistant", content=fallback_text, media_type="text"))
+        await session.commit()
+
+        if LUNA_VIDEO_AFTER_TEXT:
+            try:
+                await send_whatsapp_message(phone=phone, content=LUNA_VIDEO_AFTER_TEXT, type_="text")
+            except Exception:
+                pass
+            session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_AFTER_TEXT, media_type="text"))
+            await session.commit()
 
 # ================== endpoints ('' e '/') para evitar 307 ==================
 @router.head("")
@@ -750,7 +670,6 @@ async def webhook_post(
     except Exception:
         return JSONResponse({"received": False, "reason": "invalid JSON"}, status_code=200)
 
-    # Ignora mensagens que foram enviadas por nós (da conta do bot)
     if _is_from_me(payload):
         return JSONResponse({"received": True, "note": "from_me"}, status_code=200)
 
