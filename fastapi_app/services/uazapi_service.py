@@ -385,135 +385,52 @@ async def send_menu_interesse(
     footer_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Envia menu/botões 'Sim/Não' cobrindo variações comuns entre distros UAZAPI.
-    Tenta múltiplos formatos (JSON, form-urlencoded, query+body) e múltiplas rotas.
+    Envia um menu interativo de botões (Sim/Não) de acordo com o contrato oficial do
+    endpoint ``/send/menu`` da UAZAPI. Conforme documentado, um payload válido para
+    botões deve conter apenas os campos ``number``, ``type``, ``text``, ``choices`` e
+    opcionalmente ``footerText``【284353139205670†screenshot】. O número deve estar no formato
+    E.164 sem o sinal de ``+`` e cada opção em ``choices`` é uma string no formato
+    ``"Título|ID"``【284353139205670†screenshot】.
+
+    :param phone: número do destinatário (qualquer formato; apenas dígitos serão usados)
+    :param text: mensagem principal exibida acima dos botões
+    :param yes_label: texto do botão de confirmação
+    :param no_label: texto do botão de recusa
+    :param footer_text: texto opcional exibido abaixo dos botões
+    :return: resposta JSON da UAZAPI se sucesso; gera RuntimeError em falha
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
-    headers = _headers()
-    digits = _only_digits(phone) or phone
-    plus_digits = digits if str(digits).startswith("+") else f"+{digits}"
-
-    # Variações de destino aceitas em diferentes instâncias
-    dest_variants: List[Dict[str, Any]] = [
-        {"number": digits}, {"number": plus_digits},
-        {"phone": digits}, {"phone": plus_digits},
-        {"to": digits}, {"to": plus_digits},
-        {"chatId": f"{digits}@c.us"},
-        {"jid": f"{digits}@s.whatsapp.net"},
-    ]
-
-    # Estruturas de payload mais comuns para botões
-    structures: List[Dict[str, Any]] = [
-        # A) buttonText/description/buttons(id,body)
-        {
-            "buttonText": text,
-            "description": footer_text or "",
-            "buttons": [
-                {"id": "YES", "body": yes_label},
-                {"id": "NO", "body": no_label},
-            ],
-        },
-        # B) message/footer/buttons(buttonId,buttonText.displayText,type) (OpenWA/whatsapp-web.js style)
-        {
-            "message": text,
-            "footer": footer_text or "",
-            "buttons": [
-                {"buttonId": "YES", "buttonText": {"displayText": yes_label}, "type": 1},
-                {"buttonId": "NO", "buttonText": {"displayText": no_label}, "type": 1},
-            ],
-            "headerType": 1,
-        },
-        # C) text/footer/buttons(id,body)
-        {
-            "text": text,
-            "footer": footer_text or "",
-            "buttons": [
-                {"id": "YES", "body": yes_label},
-                {"id": "NO", "body": no_label},
-            ],
-        },
-        # D) text/footer/options (algumas distros usam 'options' como lista de strings)
-        {
-            "text": text,
-            "footer": footer_text or "",
-            "options": [yes_label, no_label],
-        },
-        # E) title/footer/buttons(lista de strings)
-        {
-            "title": text,
-            "footer": footer_text or "",
-            "buttons": [yes_label, no_label],
-        },
-        # F) text + button1/button2 campos planos
-        {
-            "text": text,
-            "button1": yes_label,
-            "button2": no_label,
-            "footer": footer_text or "",
-        },
-    ]
-
+    digits = _only_digits(phone)
+    if not digits:
+        raise ValueError("Número de telefone inválido ou vazio.")
+    # Constrói o payload conforme a documentação oficial da UAZAPI para mensagens interativas
+    payload: Dict[str, Any] = {
+        "number": digits,
+        "type": "button",
+        "text": text,
+        "choices": [
+            f"{yes_label}|YES",
+            f"{no_label}|NO",
+        ],
+    }
+    if footer_text:
+        payload["footerText"] = footer_text
+    endpoint = _ensure_leading_slash(UAZAPI_SEND_MENU_PATH or "/send/menu")
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=UAZAPI_TIMEOUT) as client:
-        for endpoint in _menu_endpoints():
-            endpoint = _ensure_leading_slash(endpoint)
-
-            # 1) JSON attempts
-            for d in dest_variants:
-                for st in structures:
-                    payload = {**d, **st}
-                    try:
-                        resp = await client.post(endpoint, json=payload, headers=headers)
-                        if resp.status_code < 400:
-                            try:
-                                return resp.json()
-                            except Exception:
-                                return {"status": "ok", "http_status": resp.status_code}
-                        else:
-                            print(f"[uazapi] MENU {endpoint} JSON{list(payload.keys())} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
-                    except Exception as exc:
-                        print(f"[uazapi] MENU exception {endpoint} JSON{list(payload.keys())}: {exc}")
-
-            # 2) form-urlencoded attempts (serializa estruturas em JSON strings quando necessário)
-            for d in dest_variants:
-                for st in structures:
-                    form = _flatten_for_form({**d, **st})
-                    try:
-                        resp = await client.post(endpoint, data=form, headers=headers)
-                        if resp.status_code < 400:
-                            try:
-                                return resp.json()
-                            except Exception:
-                                return {"status": "ok", "http_status": resp.status_code}
-                        else:
-                            print(f"[uazapi] MENU {endpoint} FORM{list(form.keys())} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
-                    except Exception as exc:
-                        print(f"[uazapi] MENU exception {endpoint} FORM{list(form.keys())}: {exc}")
-
-            # 3) params + body attempts (destino em query, corpo simples)
-            for d in dest_variants:
-                body_variants = [
-                    {"text": text, "footer": footer_text or "", "buttons": json.dumps([yes_label, no_label], ensure_ascii=False)},
-                    {"message": text, "footer": footer_text or "", "buttons": json.dumps([yes_label, no_label], ensure_ascii=False)},
-                    {"buttonText": text, "description": footer_text or "", "buttons": json.dumps([
-                        {"id": "YES", "body": yes_label},
-                        {"id": "NO", "body": no_label}
-                    ], ensure_ascii=False)},
-                ]
-                for b in body_variants:
-                    try:
-                        resp = await client.post(endpoint, params=d, data=b, headers=headers)
-                        if resp.status_code < 400:
-                            try:
-                                return resp.json()
-                            except Exception:
-                                return {"status": "ok", "http_status": resp.status_code}
-                        else:
-                            print(f"[uazapi] MENU {endpoint} PARAMS{list(d.keys())}+FORM{list(b.keys())} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
-                    except Exception as exc:
-                        print(f"[uazapi] MENU exception {endpoint} PARAMS{list(d.keys())}: {exc}")
-
-    raise RuntimeError(f"UAZAPI menu send failed for phone={phone}")
+        resp = await client.post(endpoint, json=payload, headers=_headers())
+        body = resp.text
+        if resp.status_code >= 400:
+            # Log do erro para depuração; inclui parte do corpo retornado
+            print(f"[uazapi] MENU {endpoint} status={resp.status_code} body={body[:300]}")
+            raise RuntimeError(
+                f"UAZAPI menu send failed for phone={phone} status={resp.status_code}"
+            )
+        # Retorna o JSON decodificado se possível, ou um dict genérico caso contrário
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": "ok", "http_status": resp.status_code, "raw": body}
 
 
 # -------------------- Alias retrocompat --------------------
