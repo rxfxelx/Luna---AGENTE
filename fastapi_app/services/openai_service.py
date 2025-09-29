@@ -1,211 +1,202 @@
 # fastapi_app/services/openai_service.py
-"""
-Integração com OpenAI Assistants v2.
-
-Principais funções expostas:
-- get_or_create_thread(session, user) -> str
-- ask_assistant_actions(thread_id: str, text: str) -> dict
-    Retorna {"reply_text": str, "actions": [{"name": str, "args": dict}, ...]}
-- ask_assistant(thread_id: str, text: str) -> str
-    Compatibilidade: retorna apenas o texto final do assistant.
-
-Observações importantes:
-- Quando o run entra em `requires_action`, coletamos as tool-calls e
-  SUBMETEMOS tool_outputs "OK" para liberar o run e obter a resposta final.
-  Também devolvemos as ações para o caller executá-las (ex.: enviar menu/vídeo).
-"""
-
 from __future__ import annotations
 
-import asyncio
-import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import asyncio
+from typing import Any, Dict, Optional, Tuple, List
 
-from openai import AsyncOpenAI
+import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models.db_models import User  # apenas para type hints, se quiser
+from ..models.db_models import User
 
-
-# -------------------- ENV --------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # usado no fallback de chat
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY não configurada.")
-if not ASSISTANT_ID:
-    # não paramos a app, mas avisamos
-    print("[openai] WARN: ASSISTANT_ID não configurado – use tools por texto (#tools(...)) ou configure o ID.")
 
-_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Header exigido para Assistants v2
+# Ref. geral sobre Assistants v2 e descontinuação da v1 beta: https://platform.openai.com/docs/deprecations
+_OPENAI_HEADERS = {
+    "Authorization": f"Bearer {OPENAI_API_KEY}",
+    "OpenAI-Beta": "assistants=v2",
+}
 
+_THREAD_CACHE: Dict[int, str] = {}  # user_id -> thread_id (fallback em memória)
 
-# -------------------- helpers --------------------
-def _get_user_thread_attr_name(user: Any) -> Optional[str]:
-    """
-    Descobre dinamicamente qual atributo do User guarda o thread_id.
-    Tenta em ordem alguns nomes comuns.
-    """
-    for attr in ("openai_thread_id", "assistant_thread_id", "thread_id", "thread"):
+async def _create_thread(client: httpx.AsyncClient) -> str:
+    r = await client.post(f"{OPENAI_BASE_URL}/threads", headers=_OPENAI_HEADERS, json={})
+    r.raise_for_status()
+    data = r.json()
+    return data["id"]
+
+async def get_or_create_thread(session: AsyncSession, user: User) -> str:
+    # tenta achar um atributo persistido no modelo
+    for attr in ("openai_thread_id", "thread_id", "openai_thread"):
+        tid = getattr(user, attr, None)
+        if isinstance(tid, str) and tid.strip():
+            return tid.strip()
+
+    # cache em memória (ajuda caso o modelo não tenha coluna)
+    if user.id in _THREAD_CACHE:
+        return _THREAD_CACHE[user.id]
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        thread_id = await _create_thread(client)
+
+    # tenta persistir em alguma coluna conhecida; se não existir, ignora
+    saved = False
+    for attr in ("openai_thread_id", "thread_id", "openai_thread"):
         if hasattr(user, attr):
-            return attr
-    return None
+            try:
+                setattr(user, attr, thread_id)
+                await session.commit()
+                saved = True
+                break
+            except Exception:
+                await session.rollback()
+                break
 
+    if not saved:
+        _THREAD_CACHE[user.id] = thread_id
+    return thread_id
 
-async def get_or_create_thread(session, user: User) -> str:
+async def _list_messages_text(client: httpx.AsyncClient, thread_id: str) -> str:
+    r = await client.get(
+        f"{OPENAI_BASE_URL}/threads/{thread_id}/messages",
+        headers=_OPENAI_HEADERS,
+        params={"limit": 10, "order": "desc"},
+    )
+    r.raise_for_status()
+    data = r.json()
+    for msg in data.get("data", []):
+        if msg.get("role") == "assistant":
+            for part in msg.get("content", []):
+                if part.get("type") == "text":
+                    return (part.get("text", {}) or {}).get("value", "") or ""
+    return ""
+
+async def _submit_dummy_tool_outputs(client: httpx.AsyncClient, thread_id: str, run_id: str, required: dict) -> None:
     """
-    Obtém (ou cria) o thread_id e persiste no usuário.
-    Não altera seu schema: usa o primeiro atributo existente dentre:
-    openai_thread_id / assistant_thread_id / thread_id / thread.
-    Se nenhum existir, tenta usar 'openai_thread_id' (silenciosamente).
+    Se o Assistente pedir ferramentas (requires_action), submetemos saídas mínimas ("ok") para destravar o fluxo.
     """
-    attr = _get_user_thread_attr_name(user) or "openai_thread_id"
-    tid: Optional[str] = getattr(user, attr, None)
-    if tid:
-        return tid
-
-    thread = await _client.beta.threads.create()
-    tid = thread.id
-    try:
-        setattr(user, attr, tid)
-        session.add(user)
-        await session.commit()
-    except Exception as exc:
-        print(f"[openai] WARN: falha ao persistir thread_id no usuário ({attr}): {exc!r}")
-    return tid
-
-
-async def _poll_run(thread_id: str, run_id: str, *, interval: float = 0.8, timeout: float = 45.0) -> Dict[str, Any]:
-    """
-    Faz polling do run até sair de estados transitórios.
-    Retorna o objeto run final.
-    """
-    elapsed = 0.0
-    while True:
-        run = await _client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
-        status = getattr(run, "status", "")
-        if status not in {"queued", "in_progress", "requires_action"}:
-            return run.model_dump() if hasattr(run, "model_dump") else dict(run)
-        await asyncio.sleep(interval)
-        elapsed += interval
-        if elapsed >= timeout:
-            return run.model_dump() if hasattr(run, "model_dump") else dict(run)
-
-
-def _extract_text_from_messages(messages: Any) -> str:
-    """
-    Concatena o conteúdo textual das mensagens assistant mais recentes.
-    """
-    out_parts: List[str] = []
-    try:
-        for m in messages.data:
-            if m.role != "assistant":
-                continue
-            for piece in m.content or []:
-                if getattr(piece, "type", "") == "text":
-                    out_parts.append(piece.text.value or "")
-            if out_parts:
-                break  # pega apenas a primeira mensagem assistant mais recente
-    except Exception:
-        # fallback generoso
+    tool_outputs: List[Dict[str, str]] = []
+    for call in required.get("tool_calls", []):
+        tool_outputs.append({"tool_call_id": call["id"], "output": "ok"})
+    if tool_outputs:
+        r = await client.post(
+            f"{OPENAI_BASE_URL}/threads/{thread_id}/runs/{run_id}/submit_tool_outputs",
+            headers=_OPENAI_HEADERS,
+            json={"tool_outputs": tool_outputs},
+        )
+        # mesmo que falhe, continuamos polling
         try:
-            for m in messages.get("data", []):  # type: ignore[assignment]
-                if m.get("role") != "assistant":
-                    continue
-                for piece in m.get("content", []):
-                    if piece.get("type") == "text":
-                        out_parts.append(piece["text"]["value"])
-                if out_parts:
-                    break
+            r.raise_for_status()
         except Exception:
             pass
-    return "\n".join(p for p in out_parts if p).strip()
 
-
-def _parse_tool_calls_from_run(run_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+async def ask_assistant(thread_id: str, text: str, *, max_wait_seconds: int = 18) -> str:
     """
-    A partir de um objeto run em 'requires_action', extrai as tool-calls
-    (nome e argumentos em dict).
+    Cria mensagem no thread, dispara um Run e faz polling curto até obter a resposta.
+    - Em 'requires_action': envia 'tool_outputs' mínimos para destravar.
+    - Se exceder timeout: tenta fallback chat.completions com OPENAI_MODEL.
     """
-    actions: List[Dict[str, Any]] = []
-    try:
-        ra = run_obj.get("required_action", {}) or {}
-        st = ra.get("submit_tool_outputs", {}) or {}
-        for tc in st.get("tool_calls", []) or []:
-            func = tc.get("function", {}) or {}
-            name = (func.get("name") or "").strip()
-            args_text = func.get("arguments") or "{}"
-            args: Dict[str, Any]
-            try:
-                args = json.loads(args_text)
-            except Exception:
-                args = {}
-            if name:
-                actions.append({"name": name, "args": args, "tool_call_id": tc.get("id")})
-    except Exception as exc:
-        print(f"[openai] WARN: falha ao extrair tool-calls: {exc!r}")
-    return actions
+    if not ASSISTANT_ID:
+        # Sem assistente definido: cai direto no fallback chat.completions
+        return await _chat_fallback(text)
 
-
-async def ask_assistant_actions(thread_id: str, text: str) -> Dict[str, Any]:
-    """
-    Envia `text` ao thread, executa um run e retorna:
-      {"reply_text": str, "actions": [{"name": ..., "args": {...}}]}
-    Obs.: Se houver tools, SUBMETE tool_outputs "OK" para destravar o run
-    (o caller executa de verdade as ações no WhatsApp).
-    """
-    # 1) adiciona a mensagem do usuário
-    await _client.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=text or "",
-    )
-
-    # 2) cria o run
-    run = await _client.beta.threads.runs.create(
-        thread_id=thread_id,
-        assistant_id=ASSISTANT_ID or "",
-        model=OPENAI_MODEL or None,  # opcional
-    )
-    run_obj = run.model_dump() if hasattr(run, "model_dump") else dict(run)
-
-    # 3) polling
-    run_obj = await _poll_run(thread_id, run_obj["id"])
-
-    actions: List[Dict[str, Any]] = []
-    # 3a) se precisa de ação, colete as tools e submeta "OK" p/ continuar
-    if run_obj.get("status") == "requires_action":
-        actions = _parse_tool_calls_from_run(run_obj)
-        tool_outputs = []
-        for a in actions:
-            # Mensagem curta só para o Assistant "acreditar" que executamos.
-            tool_outputs.append({"tool_call_id": a.get("tool_call_id"), "output": "OK"})
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # 1) Adiciona mensagem do usuário
         try:
-            await _client.beta.threads.runs.submit_tool_outputs(
-                thread_id=thread_id,
-                run_id=run_obj["id"],
-                tool_outputs=tool_outputs,
+            r = await client.post(
+                f"{OPENAI_BASE_URL}/threads/{thread_id}/messages",
+                headers=_OPENAI_HEADERS,
+                json={"role": "user", "content": text},
             )
-            # poll novamente até concluir
-            run_obj = await _poll_run(thread_id, run_obj["id"])
+            r.raise_for_status()
         except Exception as exc:
-            print(f"[openai] submit_tool_outputs falhou: {exc!r}")
+            print(f"[openai] add message failed: {exc!r}; falling back to chat.")
+            return await _chat_fallback(text)
 
-    # 4) busca a última resposta textual do assistant
+        # 2) Cria Run
+        try:
+            r = await client.post(
+                f"{OPENAI_BASE_URL}/threads/{thread_id}/runs",
+                headers=_OPENAI_HEADERS,
+                json={"assistant_id": ASSISTANT_ID},
+            )
+            r.raise_for_status()
+        except Exception as exc:
+            print(f"[openai] run create failed: {exc!r}; falling back to chat.")
+            return await _chat_fallback(text)
+
+        run = r.json()
+        run_id = run["id"]
+
+        # 3) Poll até completar ou estourar timeout curto
+        slept = 0.0
+        step = 1.0
+        while slept < max_wait_seconds:
+            try:
+                r = await client.get(
+                    f"{OPENAI_BASE_URL}/threads/{thread_id}/runs/{run_id}",
+                    headers=_OPENAI_HEADERS,
+                )
+                r.raise_for_status()
+                cur = r.json()
+            except Exception as exc:
+                print(f"[openai] retrieve run error: {exc!r}")
+                await asyncio.sleep(step)
+                slept += step
+                continue
+
+            status = cur.get("status")
+            if status == "completed":
+                return await _list_messages_text(client, thread_id)
+            if status == "requires_action":
+                required = (cur.get("required_action") or {}).get("submit_tool_outputs", {})
+                await _submit_dummy_tool_outputs(client, thread_id, run_id, required)
+            elif status in {"failed", "cancelled", "expired"}:
+                print(f"[openai] run finished with status={status}")
+                break
+
+            await asyncio.sleep(step)
+            slept += step
+
+        # 4) Timeout → fallback chat
+        return await _chat_fallback(text)
+
+async def _chat_fallback(text: str) -> str:
+    """
+    Fallback rápido via /chat/completions, com uma instrução mínima para manter o protocolo #tools(...).
+    """
+    if not OPENAI_MODEL:
+        return "Certo!"
+    sys = (
+        "Você é a Luna, assistente da Verbo Vídeo. Seja objetiva, amigável e, quando "
+        "quiser disparar ações externas, inclua tags no final do texto como #tools(menu), "
+        "#tools(video) ou #tools(handoff)."
+    )
     try:
-        msgs = await _client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=10)
-        reply_text = _extract_text_from_messages(msgs)
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(
+                f"{OPENAI_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": [
+                        {"role": "system", "content": sys},
+                        {"role": "user", "content": text},
+                    ],
+                    "temperature": 0.4,
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            return (data["choices"][0]["message"]["content"] or "").strip() or "Certo!"
     except Exception as exc:
-        print(f"[openai] WARN: falha ao ler mensagens do thread: {exc!r}")
-        reply_text = ""
-
-    return {"reply_text": reply_text, "actions": actions}
-
-
-async def ask_assistant(thread_id: str, text: str) -> str:
-    """
-    Compatibilidade: devolve apenas o texto final.
-    """
-    res = await ask_assistant_actions(thread_id, text)
-    return res.get("reply_text") or ""
+        print(f"[openai] chat fallback failed: {exc!r}")
+        return "Certo!"
