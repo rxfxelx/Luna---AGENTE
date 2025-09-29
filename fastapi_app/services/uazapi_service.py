@@ -24,7 +24,7 @@ UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN", "")
 # 'token' | 'apikey' | 'authorization_bearer'
 UAZAPI_AUTH_HEADER_NAME = os.getenv("UAZAPI_AUTH_HEADER_NAME", "token").lower()
 
-# Rotas vindas do ambiente (serão tentadas junto com fallbacks)
+# Rotas vindas do ambiente (usadas junto com fallbacks)
 UAZAPI_SEND_TEXT_PATH  = os.getenv("UAZAPI_SEND_TEXT_PATH", "/send/text")
 UAZAPI_SEND_MEDIA_PATH = os.getenv("UAZAPI_SEND_MEDIA_PATH", "/send/media")
 UAZAPI_SEND_MENU_PATH  = os.getenv("UAZAPI_SEND_MENU_PATH", "/send/menu")
@@ -100,7 +100,6 @@ def _text_endpoints() -> list[str]:
     return _dedup(["/send/text", UAZAPI_SEND_TEXT_PATH] + _TEXT_FALLBACKS)
 
 def _media_endpoints() -> list[str]:
-    # Para alinhar com seus logs, tentamos o endpoint configurado e o /send/media antes dos fallbacks.
     return _dedup([UAZAPI_SEND_MEDIA_PATH, "/send/media"] + _MEDIA_FALLBACKS)
 
 def _menu_endpoints() -> list[str]:
@@ -139,11 +138,10 @@ async def send_whatsapp_message(
     headers = _headers()
     digits = _only_digits(phone) or phone
 
-    async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=45.0) as client:
+    async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=60.0) as client:
         # ===================== TEXT =====================
         if type_ == "text" or not media_url:
             for endpoint in _text_endpoints():
-                # Variações aceitas em instalações diferentes
                 if endpoint == "/send/text":
                     candidates: List[Dict[str, Any]] = [
                         {"number": digits, "text": content},
@@ -178,56 +176,59 @@ async def send_whatsapp_message(
             raise RuntimeError(f"Uazapi text send failed for phone={phone}")
 
         # ===================== MEDIA =====================
-        # 1) Multipart (file + number) primeiro — foi o que sua instância exigiu pelos logs
+        # Importante: a sua instância exige multipart + querystring 'number'
         mime = mime_type or _infer_mime_from_url(media_url)
         file_bytes, filename = await _download_bytes(media_url or "")
-        if file_bytes:
-            for endpoint in _media_endpoints():
-                # Tentativa 1: somente 'number' + 'file' (+caption)
-                try_fields_list: List[Dict[str, Any]] = [
-                    {"number": digits, "caption": (caption or content or "").strip()},
-                    # Tentativas adicionais com chaves variantes
-                    {"phone": digits, "caption": (caption or content or "").strip()},
-                    {"jid": f"{digits}@s.whatsapp.net", "caption": (caption or content or "").strip()},
-                    {"chatId": f"{digits}@c.us", "caption": (caption or content or "").strip()},
-                    {"number": digits, "text": (caption or content or "").strip()},
-                ]
-                files = {"file": (filename or "file", file_bytes, mime)}
+        if not file_bytes:
+            raise RuntimeError("Falha ao baixar o arquivo de mídia para upload multipart.")
 
-                for fields in try_fields_list:
-                    try:
-                        resp = await client.post(_ensure_leading_slash(endpoint), data=fields, files=files, headers=headers)
-                        if resp.status_code < 400:
-                            try:
-                                return resp.json()
-                            except Exception:
-                                return {"status": "ok", "http_status": resp.status_code}
-                        else:
-                            print(f"[uazapi] {endpoint} FORM {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
-                    except Exception as exc:
-                        print(f"[uazapi] exception on {endpoint} FORM fields={list(fields.keys())}: {exc}")
+        files = {"file": (filename or "file", file_bytes, mime)}
+        base_caption = (caption or content or "").strip()
 
-        # 2) JSON por URL (algumas instâncias aceitam)
         for endpoint in _media_endpoints():
-            json_candidates: List[Dict[str, Any]] = [
-                {"number": digits, "url": media_url, "caption": caption or content},
-                {"phone": digits, "url": media_url, "caption": caption or content},
-                {"jid": f"{digits}@s.whatsapp.net", "url": media_url, "caption": caption or content},
-                {"chatId": f"{digits}@c.us", "fileUrl": media_url, "mimeType": mime, "caption": caption or content},
+            endpoint = _ensure_leading_slash(endpoint)
+
+            # --- (A) multipart com 'number' na QUERY (principal) ---
+            query_variants = [
+                {"number": digits},
+                {"phone": digits},
+                {"chatId": f"{digits}@c.us"},
+                {"jid": f"{digits}@s.whatsapp.net"},
             ]
-            for payload in json_candidates:
+            for q in query_variants:
                 try:
-                    resp = await client.post(_ensure_leading_slash(endpoint), json=payload, headers=headers)
+                    resp = await client.post(endpoint, params=q, data={"caption": base_caption}, files=files, headers=headers)
                     if resp.status_code < 400:
                         try:
                             return resp.json()
                         except Exception:
                             return {"status": "ok", "http_status": resp.status_code}
                     else:
-                        print(f"[uazapi] {endpoint} JSON {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                        print(f"[uazapi] {endpoint} QUERY{list(q.keys())} FORM {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
                 except Exception as exc:
-                    print(f"[uazapi] exception on {endpoint} JSON payload={list(payload.keys())}: {exc}")
+                    print(f"[uazapi] exception on {endpoint} QUERY{list(q.keys())} multipart: {exc}")
 
+            # --- (B) multipart com 'number' no BODY (algumas distros) ---
+            form_variants = [
+                {"number": digits, "caption": base_caption},
+                {"phone": digits, "caption": base_caption},
+                {"chatId": f"{digits}@c.us", "caption": base_caption},
+                {"jid": f"{digits}@s.whatsapp.net", "caption": base_caption},
+            ]
+            for form in form_variants:
+                try:
+                    resp = await client.post(endpoint, data=form, files=files, headers=headers)
+                    if resp.status_code < 400:
+                        try:
+                            return resp.json()
+                        except Exception:
+                            return {"status": "ok", "http_status": resp.status_code}
+                    else:
+                        print(f"[uazapi] {endpoint} FORM{list(form.keys())} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                except Exception as exc:
+                    print(f"[uazapi] exception on {endpoint} FORM{list(form.keys())}: {exc}")
+
+        # Se nada funcionou:
         raise RuntimeError(f"Uazapi media send failed for phone={phone}")
 
 # -------------------- Menu --------------------
@@ -272,14 +273,11 @@ async def send_menu_interesse(
 
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=30.0) as client:
         for endpoint in _menu_endpoints():
+            endpoint = _ensure_leading_slash(endpoint)
             # JSON
             for payload in json_payloads:
                 try:
-                    resp = await client.post(
-                        _ensure_leading_slash(endpoint),
-                        json=payload,
-                        headers={**headers, "Content-Type": "application/json"},
-                    )
+                    resp = await client.post(endpoint, json=payload, headers={**headers, "Content-Type": "application/json"})
                     if resp.status_code < 400:
                         try:
                             return resp.json()
@@ -293,11 +291,7 @@ async def send_menu_interesse(
             # FORM
             for payload in form_payloads:
                 try:
-                    resp = await client.post(
-                        _ensure_leading_slash(endpoint),
-                        data=payload,
-                        headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
-                    )
+                    resp = await client.post(endpoint, data=payload, headers={**headers, "Content-Type": "application/x-www-form-urlencoded"})
                     if resp.status_code < 400:
                         try:
                             return resp.json()
