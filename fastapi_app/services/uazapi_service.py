@@ -171,34 +171,84 @@ async def send_whatsapp_message(
 
     headers = _headers()
     digits = _only_digits(phone) or phone
+    plus_digits = digits if str(digits).startswith("+") else f"+{digits}"
 
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=60.0) as client:
         # ============ TEXTO ============
         if type_ == "text" or not media_url:
             for endpoint in _text_endpoints():
                 endpoint = _ensure_leading_slash(endpoint)
-                # Variações de payload para diferentes distros
-                candidates: List[Dict[str, Any]] = []
-                for cid in _chatid_variants(digits):
-                    candidates.append({"chatId": cid, "text": content})
-                    candidates.append({"chatId": cid, "message": content})
-                candidates.append({"phone": digits, "text": content})
-                candidates.append({"number": digits, "text": content})
-                candidates.append({"phone": digits, "message": content})
-                candidates.append({"number": digits, "message": content})
 
-                for payload in candidates:
+                # Variações de destino e conteúdo para diferentes distros
+                dest_variants: List[Dict[str, Any]] = [
+                    {"number": digits}, {"number": plus_digits},
+                    {"phone": digits},  {"phone": plus_digits},
+                    {"to": digits},     {"to": plus_digits},
+                    {"chatId": f"{digits}@c.us"},
+                    {"jid": f"{digits}@s.whatsapp.net"},
+                ]
+                text_variants: List[Dict[str, Any]] = [
+                    {"text": content},
+                    {"message": content},
+                    {"body": content},
+                ]
+
+                # (1) JSON attempts
+                for d in dest_variants:
+                    for t in text_variants:
+                        payload = {**d, **t}
+                        try:
+                            resp = await client.post(endpoint, json=payload, headers=headers)
+                            if resp.status_code < 400:
+                                try:
+                                    return resp.json()
+                                except Exception:
+                                    return {"status": "ok", "http_status": resp.status_code}
+                            else:
+                                print(f"[uazapi] {endpoint} JSON{list(payload.keys())} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                        except Exception as exc:
+                            print(f"[uazapi] exception on {endpoint} JSON{list(payload.keys())}: {exc}")
+
+                # (2) form-urlencoded attempts
+                for d in dest_variants:
+                    for t in text_variants:
+                        form = {**d, **t}
+                        try:
+                            resp = await client.post(endpoint, data=form, headers=headers)
+                            if resp.status_code < 400:
+                                try:
+                                    return resp.json()
+                                except Exception:
+                                    return {"status": "ok", "http_status": resp.status_code}
+                            else:
+                                print(f"[uazapi] {endpoint} FORM{list(form.keys())} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                        except Exception as exc:
+                            print(f"[uazapi] exception on {endpoint} FORM{list(form.keys())}: {exc}")
+
+                # (3) params + body attempts (alguns endpoints esperam number na query)
+                for d in dest_variants:
                     try:
-                        resp = await client.post(endpoint, json=payload, headers=headers)
+                        # Primeiro com body 'text'
+                        resp = await client.post(endpoint, params=d, data={"text": content}, headers=headers)
                         if resp.status_code < 400:
                             try:
                                 return resp.json()
                             except Exception:
                                 return {"status": "ok", "http_status": resp.status_code}
                         else:
-                            print(f"[uazapi] {endpoint} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                            print(f"[uazapi] {endpoint} PARAMS{list(d.keys())}+FORM[text] {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+                        # Depois com body 'message'
+                        resp = await client.post(endpoint, params=d, data={"message": content}, headers=headers)
+                        if resp.status_code < 400:
+                            try:
+                                return resp.json()
+                            except Exception:
+                                return {"status": "ok", "http_status": resp.status_code}
+                        else:
+                            print(f"[uazapi] {endpoint} PARAMS{list(d.keys())}+FORM[message] {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
                     except Exception as exc:
-                        print(f"[uazapi] exception on {endpoint} payload={list(payload.keys())}: {exc}")
+                        print(f"[uazapi] exception on {endpoint} PARAMS{list(d.keys())}: {exc}")
+
             raise RuntimeError(f"UAZAPI text send failed for phone={phone}")
 
         # ============ MÍDIA (inclui VÍDEO) ============
@@ -210,7 +260,9 @@ async def send_whatsapp_message(
             base_payload = {"mediatype": "video", "media_url": media_url, "caption": base_caption}
             candidate_payloads: List[Dict[str, Any]] = [
                 {**base_payload, "number": digits},
+                {**base_payload, "number": plus_digits},
                 {**base_payload, "phone": digits},
+                {**base_payload, "phone": plus_digits},
                 {**base_payload, "jid": f"{digits}@s.whatsapp.net"},
                 {**base_payload, "chatId": f"{digits}@c.us"},
             ]
@@ -243,7 +295,9 @@ async def send_whatsapp_message(
             # (A) 'number' na query (muitas instâncias exigem)
             query_variants = [
                 {"number": digits},
+                {"number": plus_digits},
                 {"phone": digits},
+                {"phone": plus_digits},
                 {"chatId": f"{digits}@c.us"},
                 {"jid": f"{digits}@s.whatsapp.net"},
             ]
@@ -263,7 +317,9 @@ async def send_whatsapp_message(
             # (B) 'number' no body (outras variantes)
             form_variants = [
                 {"number": digits, "caption": base_caption},
+                {"number": plus_digits, "caption": base_caption},
                 {"phone": digits, "caption": base_caption},
+                {"phone": plus_digits, "caption": base_caption},
                 {"chatId": f"{digits}@c.us", "caption": base_caption},
                 {"jid": f"{digits}@s.whatsapp.net", "caption": base_caption},
             ]
@@ -386,7 +442,6 @@ async def upload_file_to_baserow(source: str) -> Optional[Dict[str, Any]]:
                     try:
                         resp = await client.get(path, headers=headers)
                         if resp.status_code < 400:
-                            # Espera JSON; se não for JSON, cai no except e tenta próximo
                             try:
                                 return resp.json()
                             except Exception:
