@@ -1,4 +1,3 @@
-# fastapi_app/routes/whatsapp.py
 """
 Webhook e endpoints para WhatsApp (Uazapi).
 
@@ -385,6 +384,50 @@ def _looks_like_invite(reply_text: str) -> bool:
     t = _normalize(reply_text)
     return any(p in t for p in _INVITE_PATTERNS)
 
+# --------- NLU leve: formato (evitar pergunta duplicada) ---------
+
+# Mapas canônicos para formatos
+_FORMAT_PATTERNS = {
+    "3d/ia": [
+        r"\b3\s*[-/]?\s*d\b",       # 3d | 3-d
+        r"\b3d\s*ia\b", r"\bia\s*3d\b",
+        r"animac(?:ao|ão)\s*3\s*[-/]?\s*d",
+    ],
+    "institucional": [r"\binstitucional\b", r"\binstitu(?:cional|cional)\b"],
+    "produto":       [r"\bproduto(?:s)?\b", r"video\s*de\s*produto"],
+    "educativo":     [r"\beducativo\b", r"\baula(?:s)?\b", r"\btutorial(?:es)?\b", r"\btreinamento\b"],
+    "convite":       [r"\bconvite(?:s)?\b"],
+    "homenagem":     [r"\bhomenagem(?:s)?\b", r"\btributo\b"],
+}
+
+_PREFIX_NOISE = r"(?:era|eh|é|foi|quero|queria|pode\s*ser|seria|talvez|acho\s*que)\s+"
+
+def _extract_formato(texto: Optional[str]) -> Optional[str]:
+    """Detecta formato em texto livre (ex.: 'era 3D', 'quero educativo', 'animação 3d')."""
+    if not texto:
+        return None
+    t = _normalize(texto)
+    # remove ruídos iniciais ("era", "quero", ...)
+    t = re.sub(rf"^{_PREFIX_NOISE}", "", t)
+    for can, patterns in _FORMAT_PATTERNS.items():
+        for rx in patterns:
+            if re.search(rx, t, flags=re.IGNORECASE):
+                return can
+    return None
+
+def _looks_like_format_question(texto: Optional[str]) -> bool:
+    """Heurística: identifica se a IA está perguntando sobre formato."""
+    if not texto:
+        return False
+    t = _normalize(texto)
+    if "qual formato" in t or "formato te interessa" in t or "formato voce" in t or "formato você" in t:
+        return True
+    # pergunta listando opções conhecidas
+    if "3d" in t or "institucional" in t or "educativo" in t or "produto" in t or "convite" in t or "homenagem" in t:
+        if "formato" in t:
+            return True
+    return False
+
 # --------- IA tool-hints (tags e linguagem natural) ---------
 
 _TOOL_TAG_RE = re.compile(r"#tools?\s*\(\s*([^)]+)\)", re.I)
@@ -618,6 +661,9 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 digits_phone = _only_digits(phone or "")
                 meta_phone = f"(meta: phone_do_lead:+{digits_phone}. Ao chamar tools use este valor no parâmetro 'phone'.) "
 
+                # >>> NLU leve: detectar formato informado pelo usuário para evitar repergunta
+                user_formato = _extract_formato(text or "")
+
                 prefix = ""
                 if video_recent:
                     prefix = (
@@ -634,15 +680,27 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         prefix = "Contexto: foi enviada uma caixinha de interesse ao lead. Mensagem do lead: "
 
                 ai_input = (meta_phone + prefix + (text or "")).strip()
+
+                # Injeta instrução para NÃO repetir pergunta de formato se já identificado
+                if user_formato:
+                    ai_input += f" [contexto_formato: o lead já indicou o formato '{user_formato}'. Não repita a pergunta de formato; confirme e avance.]"
+
                 reply_text = await ask_assistant(thread_id, ai_input) or ""
 
-                wants_menu, wants_video, wants_handoff = _parse_tool_hints(reply_text)
+                # Guarda o texto bruto para detectar tool-hints antes de qualquer ajuste
+                raw_reply_for_tools = reply_text
+
+                # Se a IA insistir em perguntar formato mas nós já temos, substitui por confirmação
+                if user_formato and _looks_like_format_question(reply_text):
+                    reply_text = f"Perfeito, anotei: **{user_formato}**. Vamos avançar para os próximos passos?"
+
+                wants_menu, wants_video, wants_handoff = _parse_tool_hints(raw_reply_for_tools)
 
                 # 1.a) Se a IA pediu caixinha/convite
-                if (wants_menu or _looks_like_invite(reply_text)) and not menu_recent:
+                if (wants_menu or _looks_like_invite(raw_reply_for_tools)) and not menu_recent:
                     await _enviar_menu(session, phone, user)
                     return
-                if (wants_menu or _looks_like_invite(reply_text)) and menu_recent:
+                if (wants_menu or _looks_like_invite(raw_reply_for_tools)) and menu_recent:
                     print("[guard] IA/convite pediu caixinha, mas já existe recente; ignorando convite.")
 
                 # 1.b) Se a IA pediu VÍDEO
@@ -663,7 +721,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     return
 
                 # 1.e) Anti-eco (convite) após caixinha
-                if menu_recent and _looks_like_invite(reply_text):
+                if menu_recent and _looks_like_invite(raw_reply_for_tools):
                     print("[guard] menu enviado há pouco; suprimindo texto convite duplicado.")
                     return
 
