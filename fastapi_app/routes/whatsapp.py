@@ -641,9 +641,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
             # 0) Se houve caixinha recente, trate SIM/NÃO localmente (sem IA).
             if msg_type == "text" and text and menu_recent:
-                if _is_positive_reply(text):
-                    await _enviar_video(session, phone, user)
-                    return
+                # NEGATIVO: sempre encerra
                 if _is_negative_reply(text):
                     end_text = LUNA_END_TEXT or "Tudo bem! Se precisar depois, estou por aqui. 🌟"
                     try:
@@ -652,6 +650,10 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         print(f"[uazapi] send end_text failed (bg): {e!r}")
                     session.add(Message(user_id=user.id, sender="assistant", content=end_text, media_type="text"))
                     await session.commit()
+                    return
+                # POSITIVO: só envia vídeo se AINDA não houve envio recente; caso contrário, deixa seguir para a IA.
+                if _is_positive_reply(text) and not video_recent:
+                    await _enviar_video(session, phone, user)
                     return
 
             # 1) Texto -> consulta IA (com CONTEXTO do estado + PHONE)
