@@ -616,6 +616,10 @@ _STOPWORDS_GREET = {
     "tudo","bem","td","tmj","valeu","vlw","obg","obrigado","obrigada","kkk","haha","rs",
     "agora","depois","mais","tarde","sim","nao","não","okay","ok","okey"
 }
+_BAD_NAME_TOKENS = {
+    "atendimento","cliente","suporte","whatsapp","teste","test",
+    "pac","lead","empresa","marketing","verbo","video","vídeo","luna"
+}
 
 # padrão explícito no TEXTO original (não normalizado)
 _NAME_EXPLICIT_RE = re.compile(
@@ -632,50 +636,95 @@ def _sanitize_name(raw: str) -> Optional[str]:
     tokens = [t for t in _tokenize_words(raw) if t]
     if not tokens:
         return None
-    # remove saudações comuns no início/fim
+    # remove saudações comuns
     tokens = [t for t in tokens if _normalize(t) not in _STOPWORDS_GREET]
     if not tokens:
         return None
-    # limita a 2 palavras
-    tokens = tokens[:2]
+    tokens = tokens[:2]  # no máximo 2 palavras
     name = " ".join(tokens)
     try:
         name = name.title()
     except Exception:
         pass
-    # descartes básicos
     if len(name) < 3 or any(ch.isdigit() for ch in name) or any(ch in "?!@" for ch in name):
         return None
     return name
 
-def _extract_name_from_text(text: Optional[str], *, in_request: bool = False) -> Optional[str]:
-    """Só aceita padrão explícito; se 'in_request'=True, aceita resposta curta tipo 'Matheus'."""
-    if not text:
-        return None
-    # 1) padrão explícito
-    m = _NAME_EXPLICIT_RE.search(text)
-    if m:
-        return _sanitize_name(m.group(1))
-    # 2) se estamos pedindo o nome agora, aceitar resposta curta (ex.: 'Matheus', 'Ana Paula')
-    if in_request:
-        return _sanitize_name(text)
-    return None
+def _is_bad_name(name: Optional[str]) -> bool:
+    if not (name or "").strip():
+        return True
+    t = _normalize(name)
+    if any(ch.isdigit() for ch in t) or len(t) < 3:
+        return True
+    toks = t.split()
+    if any(tok in _STOPWORDS_GREET for tok in toks):
+        return True
+    if any(tok in _BAD_NAME_TOKENS for tok in toks):
+        return True
+    return False
 
 def _pushname_candidate(push_name: Optional[str]) -> Optional[str]:
     """Valida pushName do WhatsApp para evitar salvar 'Oi Blz', 'Atendimento', etc."""
     name = _sanitize_name(push_name or "")
-    if not name:
+    if not name or _is_bad_name(name):
         return None
-    toks = [_normalize(t) for t in _tokenize_words(name)]
-    if not toks:
-        return None
-    # se conter saudação óbvia, descarta
-    if any(t in _STOPWORDS_GREET for t in toks):
-        return None
-    # nomes de 1 letra ou siglas curtas são ruins
+    # evita nomes de 1–2 letras
+    toks = _tokenize_words(name)
     if len(toks) == 1 and len(toks[0]) <= 2:
         return None
     return name
+
+def _extract_name_from_text(text: Optional[str], *, in_request: bool = False) -> Optional[str]:
+    """Aceita padrão explícito; se 'in_request'=True, aceita resposta curta (ex.: 'Matheus')."""
+    if not text:
+        return None
+    # 1) padrão explícito sempre
+    m = _NAME_EXPLICIT_RE.search(text)
+    if m:
+        return _sanitize_name(m.group(1))
+    # 2) quando for resposta a um pedido de nome, aceitar direto 1–2 tokens
+    if in_request:
+        return _sanitize_name(text)
+    return None
+
+# Detecta se a assistente perguntou o nome recentemente
+_NAME_ASK_PATTERNS = (
+    "com quem estou falando",
+    "posso saber com quem estou falando",
+    "posso saber seu nome",
+    "qual seu nome",
+    "qual o seu nome",
+    "como posso te chamar",
+    "como te chamo",
+    "qual nome coloco",
+    "qual nome coloco aqui",
+    "com quem falo"
+)
+
+async def _assistant_asked_name_recent(session: AsyncSession, user_id: int, minutes: int = 15) -> bool:
+    try:
+        q = (
+            select(Message)
+            .where(Message.user_id == user_id, Message.sender == "assistant", Message.media_type == "text")
+            .order_by(desc(Message.created_at))
+            .limit(3)
+        )
+        res = await session.execute(q)
+        rows = res.scalars().all()
+        now = datetime.utcnow()
+        for m in rows:
+            last_at = m.created_at
+            if getattr(last_at, "tzinfo", None) is not None:
+                last_at = last_at.replace(tzinfo=None)
+            if (now - last_at) > timedelta(minutes=minutes):
+                continue
+            c = _normalize(m.content or "")
+            if any(p in c for p in _NAME_ASK_PATTERNS):
+                return True
+        return False
+    except Exception as exc:
+        print(f"[state] erro asked_name_recent: {exc!r}")
+        return False
 
 # --------- Ações de saída ---------
 
@@ -693,7 +742,7 @@ async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
         )
         session.add(Message(user_id=user.id, sender="assistant", content=LUNA_MENU_TEXT, media_type="menu"))
         await session.commit()
-        print("[menu] enviado com sucesso.")
+        print("[menu] enviado com sucesso].")
     except Exception as exc:
         print(f"[menu] falha ao enviar menu: {exc!r}")
 
@@ -772,8 +821,8 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     await session.commit()
                     await session.refresh(user)
                 else:
-                    # atualiza com pushName válido se ainda não houver nome
-                    if (not (user.name or "").strip()):
+                    # atualiza com pushName válido se ainda não houver nome ou se nome atual for ruim
+                    if not (user.name or "").strip() or _is_bad_name(user.name):
                         pn = _pushname_candidate(push_name)
                         if pn:
                             user.name = pn
@@ -812,26 +861,22 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                             ack = NAME_SAVED_TEMPLATE.format(name=cand, consultor=HANDOFF_CONSULTOR_NAME)
                         except Exception:
                             ack = f"Obrigado, {cand}! Vou te passar para {HANDOFF_CONSULTOR_NAME} agora."
-                        try:
-                            await send_whatsapp_message(phone=phone, content=ack, type_="text")
-                        except Exception as e:
-                            print(f"[name] falha ao enviar confirmação de nome: {e!r}")
-                        session.add(Message(user_id=user.id, sender="assistant", content=ack, media_type="text"))
-                        await session.commit()
-                        await _notify_consultants(session, user=user, phone=phone, user_text=text)
-                        return
                     else:
-                        try:
-                            await send_whatsapp_message(phone=phone, content=NAME_RETRY_TEMPLATE, type_="text")
-                        except Exception:
-                            pass
-                        session.add(Message(user_id=user.id, sender="assistant", content=NAME_RETRY_TEMPLATE, media_type="name_request"))
-                        await session.commit()
-                        return
+                        ack = NAME_RETRY_TEMPLATE
+                    try:
+                        await send_whatsapp_message(phone=phone, content=ack, type_="text")
+                    except Exception:
+                        pass
+                    session.add(Message(user_id=user.id, sender="assistant", content=ack, media_type="text" if cand else "name_request"))
+                    await session.commit()
+                    if cand:
+                        await _notify_consultants(session, user=user, phone=phone, user_text=text)
+                    return
 
-                # 0.2) Auto-extrai nome somente com padrão explícito (fora do name_request)
-                if msg_type == "text" and text and not (user.name or "").strip():
-                    cand = _extract_name_from_text(text, in_request=False)
+                # 0.2) Auto-extrai nome: se a assistente pediu o nome há pouco, aceitar resposta curta
+                if msg_type == "text" and text and (not (user.name or "").strip() or _is_bad_name(user.name)):
+                    asked = await _assistant_asked_name_recent(session, user.id, minutes=15)
+                    cand = _extract_name_from_text(text, in_request=asked)
                     if cand:
                         user.name = cand
                         await session.commit()
@@ -997,21 +1042,19 @@ async def webhook_post(
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
 
-    # Garante que o usuário exista e, se faltar, atualiza nome com pushName válido
+    # Garante que o usuário exista e atualiza nome com pushName válido se faltar ou se o nome atual for ruim
     res = await db.execute(select(User).where(User.phone == phone))
     user = res.scalar_one_or_none()
+    pn = _pushname_candidate(push_name)
     if not user:
-        pn = _pushname_candidate(push_name)
         user = User(phone=phone, name=pn or None)
         db.add(user)
         await db.commit()
         await db.refresh(user)
     else:
-        if (not (user.name or "").strip()):
-            pn = _pushname_candidate(push_name)
-            if pn:
-                user.name = pn
-                await db.commit()
+        if (not (user.name or "").strip() or _is_bad_name(user.name)) and pn:
+            user.name = pn
+            await db.commit()
 
     # ------ DEDUP INBOUND ------
     if await _is_probably_duplicate(db, user.id, text if msg_type == "text" else None, msg_type, window_seconds=5):
