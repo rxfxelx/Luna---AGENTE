@@ -6,8 +6,8 @@ Fluxo resumido:
 - Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints por texto ou por tag #tools()).
 - Atalho local: após a caixinha, interpreta SIM/NÃO sem chamar a IA (responde na hora).
 - Fallback opcional: vídeo após SIM na caixinha (configurável).
-- Handoff: por consentimento — só notifica consultores após o lead aceitar e INFORMAR NOME.
-- Deduplicação do inbound (mesmo conteúdo ≤ 5s), antiloop e lock por usuário.
+- Handoff: agora é por CONSENTIMENTO — só notifica consultores após o lead aceitar.
+- Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações + lock por usuário.
 """
 
 from __future__ import annotations
@@ -91,18 +91,18 @@ HANDOFF_LATER_TEMPLATE   = _env_template(
     "Combinado! Aviso {consultor}. Quando quiser falar **agora**, diga “agora” aqui que eu aciono."
 )
 
-# Coleta de nome (quando ausente)
-ASK_NAME_TEMPLATE        = _env_template(
+# >>> NOVO: coleta de nome (quando ausente)
+ASK_NAME_TEMPLATE   = _env_template(
     "ASK_NAME_TEMPLATE",
     "Para concluir o agendamento: qual nome coloco aqui?"
 )
-NAME_SAVED_TEMPLATE      = _env_template(
+NAME_SAVED_TEMPLATE = _env_template(
     "NAME_SAVED_TEMPLATE",
     "Obrigado, {name}! Vou te passar para {consultor} agora. 👍"
 )
-NAME_RETRY_TEMPLATE      = _env_template(
+NAME_RETRY_TEMPLATE = _env_template(
     "NAME_RETRY_TEMPLATE",
-    "Desculpe, não entendi. Pode me enviar **só o primeiro nome**?"
+    "Desculpe, não entendi. Pode me enviar só o *primeiro nome*?"
 )
 
 # --------------------------- Auth helpers ---------------------------
@@ -372,6 +372,7 @@ async def _has_recent_handoff(session: AsyncSession, user_id: int, minutes: int 
 async def _has_recent_handoff_offer(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "handoff_offer", minutes)
 
+# >>> NOVO: estado "name_request"
 async def _has_recent_name_request(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "name_request", minutes)
 
@@ -416,6 +417,20 @@ def _wants_later(text: Optional[str]) -> bool:
     t = _normalize(text)
     return any(p in t for p in ("mais tarde", "depois", "amanha", "amanhã"))
 
+_INVITE_PATTERNS = (
+    "quer ver em 30", "quer ver em 30s", "quer ver em 30 s",
+    "30 seg", "30seg", "30 segundos", "trinta segundos",
+    "posso te mostrar", "posso apresentar um case", "exemplo objetivo",
+    "te mostro em 30", "posso enviar um exemplo", "quer ver um exemplo",
+    "apresentar um case curto"
+)
+
+def _looks_like_invite(reply_text: str) -> bool:
+    if not reply_text:
+        return False
+    t = _normalize(reply_text)
+    return any(p in t for p in _INVITE_PATTERNS)
+
 # --------- NLU leve: formato (evitar pergunta duplicada) ---------
 
 _FORMAT_PATTERNS = {
@@ -453,53 +468,6 @@ def _looks_like_format_question(texto: Optional[str]) -> bool:
         if "formato" in t:
             return True
     return False
-
-# --------- Extração e saneamento de NOME ---------
-
-_NAME_PATTERNS = [
-    r"(?:meu\s+nome\s+e|meu\s+nome\s+é|sou|me\s+chamo|aqui\s+é)\s+([A-Za-zÀ-ÖØ-öø-ÿ'´`^~\- ]{2,})",
-]
-
-def _sanitize_name(raw: str) -> Optional[str]:
-    if not raw:
-        return None
-    # remove emojis e caracteres não-letra/dígito/espaço/hífen/apóstrofo
-    cleaned = ''.join(ch for ch in raw if ch.isalnum() or ch in " -'´`^~áàãâéêíóôõúüÁÀÃÂÉÊÍÓÔÕÚÜçÇ")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if not cleaned:
-        return None
-    # usa só as duas primeiras palavras (nome e talvez sobrenome curto)
-    parts = cleaned.split()
-    if len(parts) >= 2:
-        cleaned = " ".join(parts[:2])
-    else:
-        cleaned = parts[0]
-    # capitalização tipo título (respeitando acentos)
-    try:
-        cleaned = cleaned.title()
-    except Exception:
-        pass
-    # limites razoáveis
-    if 2 <= len(cleaned) <= 40:
-        return cleaned
-    return None
-
-def _extract_name_from_text(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    t = text.strip()
-    for rx in _NAME_PATTERNS:
-        m = re.search(rx, _normalize(t), flags=re.IGNORECASE)
-        if m:
-            # pega o trecho correspondente no texto original para preservar caixa/acentos
-            span = m.span(1)
-            candidate = t[span[0]:span[1]]
-            return _sanitize_name(candidate)
-    # fallback: se o texto for uma ou duas palavras, pode ser nome
-    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'´`^~\-]{2,}", t)
-    if 1 <= len(tokens) <= 2:
-        return _sanitize_name(" ".join(tokens))
-    return None
 
 # --------- IA tool-hints (tags e linguagem natural) ---------
 
@@ -641,6 +609,45 @@ async def _send_handoff_offer(session: AsyncSession, *, phone: str, user: User, 
     session.add(Message(user_id=user.id, sender="assistant", content=text, media_type="handoff_offer"))
     await session.commit()
 
+# --------- Extração/Saneamento de NOME (novo) ---------
+
+_NAME_PATTERNS = [
+    r"(?:meu\s+nome\s+e|meu\s+nome\s+é|sou|me\s+chamo|aqui\s+é)\s+([A-Za-zÀ-ÖØ-öø-ÿ'´`^~\- ]{2,})",
+]
+
+def _sanitize_name(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    cleaned = ''.join(ch for ch in raw if ch.isalnum() or ch in " -'´`^~áàãâéêíóôõúüÁÀÃÂÉÊÍÓÔÕÚÜçÇ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return None
+    parts = cleaned.split()
+    if len(parts) >= 2:
+        cleaned = " ".join(parts[:2])
+    else:
+        cleaned = parts[0]
+    try:
+        cleaned = cleaned.title()
+    except Exception:
+        pass
+    return cleaned if 2 <= len(cleaned) <= 40 else None
+
+def _extract_name_from_text(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    t = text.strip()
+    for rx in _NAME_PATTERNS:
+        m = re.search(rx, _normalize(t), flags=re.IGNORECASE)
+        if m:
+            span = m.span(1)
+            candidate = t[span[0]:span[1]]
+            return _sanitize_name(candidate)
+    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'´`^~\-]{2,}", t)
+    if 1 <= len(tokens) <= 2:
+        return _sanitize_name(" ".join(tokens))
+    return None
+
 # --------- Ações de saída ---------
 
 async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
@@ -734,12 +741,12 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     await session.commit()
                     await session.refresh(user)
                 else:
-                    # Se já existe e ainda não tem nome, aproveita pushName
+                    # >>> NOVO: atualiza nome com pushName se ainda não existir
                     if (not (user.name or "").strip()) and (push_name or "").strip():
                         user.name = push_name.strip()
                         await session.commit()
 
-                # Auto-extrair nome do texto, quando faltar
+                # >>> NOVO: auto-extrai nome do texto (a qualquer momento) se ainda não temos
                 if msg_type == "text" and text and not (user.name or "").strip():
                     cand = _extract_name_from_text(text)
                     if cand:
@@ -756,6 +763,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
                 # 0) Se houve caixinha recente, trate SIM/NÃO localmente (sem IA).
                 if msg_type == "text" and text and menu_recent:
+                    # NEGATIVO: encerra na hora
                     if _is_negative_reply(text):
                         end_text = LUNA_END_TEXT or "Tudo bem! Se precisar depois, estou por aqui. 🌟"
                         try:
@@ -765,11 +773,12 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         session.add(Message(user_id=user.id, sender="assistant", content=end_text, media_type="text"))
                         await session.commit()
                         return
+                    # POSITIVO: apenas se ainda não enviamos vídeo recentemente
                     if _is_positive_reply(text) and not video_recent:
                         await _enviar_video(session, phone, user)
                         return
 
-                # 0.1) Se estamos aguardando o nome (name_request), trate aqui.
+                # >>> NOVO 0.1) Se estamos aguardando o NOME (name_request), capture e prossiga ao handoff
                 if msg_type == "text" and text and name_request_recent and not handoff_recent:
                     cand = _extract_name_from_text(text)
                     if cand:
@@ -785,7 +794,6 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                             print(f"[name] falha ao enviar confirmação de nome: {e!r}")
                         session.add(Message(user_id=user.id, sender="assistant", content=ack, media_type="text"))
                         await session.commit()
-                        # agora sim, notifica consultores
                         await _notify_consultants(session, user=user, phone=phone, user_text=text)
                         return
                     else:
@@ -797,10 +805,10 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         await session.commit()
                         return
 
-                # 0.2) Se já enviamos uma OFERTA de handoff, interpretamos a resposta do lead aqui.
+                # 0.2) Respostas à OFERTA de handoff (consentimento)
                 if msg_type == "text" and text and handoff_offer_recent and not handoff_recent:
                     if _wants_now(text):
-                        # Se não temos nome, pedimos antes de notificar
+                        # Se não temos nome, pedir antes de notificar
                         if not (user.name or "").strip():
                             try:
                                 await send_whatsapp_message(phone=phone, content=ASK_NAME_TEMPLATE, type_="text")
@@ -831,7 +839,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         session.add(Message(user_id=user.id, sender="assistant", content=msg, media_type="text"))
                         await session.commit()
                         return
-                    # Não ficou claro → segue para IA.
+                    # Se não ficou claro → segue para IA.
 
                 # 1) Texto -> consulta IA (com CONTEXTO do estado + PHONE)
                 if msg_type == "text" and text:
@@ -840,6 +848,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     digits_phone = _only_digits(phone or "")
                     meta_phone = f"(meta: phone_do_lead:+{digits_phone}. Ao chamar tools use este valor no parâmetro 'phone'.) "
 
+                    # NLU leve: detectar formato informado pelo usuário para dirigir o próximo passo
                     user_formato = _extract_formato(text or "")
 
                     prefix = ""
@@ -858,12 +867,15 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                             prefix = "Contexto: foi enviada uma caixinha de interesse ao lead. Mensagem do lead: "
 
                     ai_input = (meta_phone + prefix + (text or "")).strip()
+
+                    # Sugestão para IA: se já temos formato, não perguntar de novo
                     if user_formato:
                         ai_input += f" [contexto_formato: o lead já indicou o formato '{user_formato}'. Não repita a pergunta de formato; confirme e avance.]"
 
                     reply_text = await ask_assistant(thread_id, ai_input) or ""
                     raw_reply_for_tools = reply_text
 
+                    # Se a IA insistir em perguntar formato mas nós já temos, substitui por confirmação
                     if user_formato and _looks_like_format_question(reply_text):
                         reply_text = f"Perfeito, anotei: **{user_formato}**. Vamos avançar para os próximos passos?"
 
@@ -883,12 +895,12 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     if wants_video and video_recent:
                         print("[guard] IA pediu vídeo, mas já enviamos recentemente; ignorando.")
 
-                    # 1.c) Handoff por CONSENTIMENTO: oferta (se ainda não ofertado/feito)
+                    # 1.c) Handoff por CONSENTIMENTO:
                     if (wants_handoff or user_formato) and not (handoff_recent or handoff_offer_recent):
                         await _send_handoff_offer(session, phone=phone, user=user, formato=user_formato)
                         return
 
-                    # 1.d) Fallback opcional — vídeo após SIM na caixinha
+                    # 1.d) Fallback opcional — vídeo após SIM na caixinha (se IA não mandou)
                     if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
                         await _enviar_video(session, phone, user)
                         return
@@ -952,7 +964,7 @@ async def webhook_post(
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
 
-    # Garante que o usuário exista e atualiza nome com pushName se faltar
+    # Garante que o usuário exista e, se faltar, atualiza nome com pushName
     res = await db.execute(select(User).where(User.phone == phone))
     user = res.scalar_one_or_none()
     if not user:
