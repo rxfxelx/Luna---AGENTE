@@ -91,7 +91,7 @@ HANDOFF_LATER_TEMPLATE   = _env_template(
     "Combinado! Aviso {consultor}. Quando quiser falar **agora**, diga “agora” aqui que eu aciono."
 )
 
-# >>> NOVO: coleta de nome (quando ausente)
+# >>> Coleta de nome (quando ausente)
 ASK_NAME_TEMPLATE   = _env_template(
     "ASK_NAME_TEMPLATE",
     "Para concluir o agendamento: qual nome coloco aqui?"
@@ -372,7 +372,7 @@ async def _has_recent_handoff(session: AsyncSession, user_id: int, minutes: int 
 async def _has_recent_handoff_offer(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "handoff_offer", minutes)
 
-# >>> NOVO: estado "name_request"
+# estado "name_request" (quando pedimos o nome)
 async def _has_recent_name_request(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "name_request", minutes)
 
@@ -609,44 +609,73 @@ async def _send_handoff_offer(session: AsyncSession, *, phone: str, user: User, 
     session.add(Message(user_id=user.id, sender="assistant", content=text, media_type="handoff_offer"))
     await session.commit()
 
-# --------- Extração/Saneamento de NOME (novo) ---------
+# --------- Extração/Saneamento de NOME (revisado) ---------
 
-_NAME_PATTERNS = [
-    r"(?:meu\s+nome\s+e|meu\s+nome\s+é|sou|me\s+chamo|aqui\s+é)\s+([A-Za-zÀ-ÖØ-öø-ÿ'´`^~\- ]{2,})",
-]
+_STOPWORDS_GREET = {
+    "oi","olá","ola","blz","beleza","eai","opa","oie","boa","bom","tarde","noite","dia",
+    "tudo","bem","td","tmj","valeu","vlw","obg","obrigado","obrigada","kkk","haha","rs",
+    "agora","depois","mais","tarde","sim","nao","não","okay","ok","okey"
+}
+
+# padrão explícito no TEXTO original (não normalizado)
+_NAME_EXPLICIT_RE = re.compile(
+    r"(?:meu\s+nome\s*(?:é|e)|nome\s*:|sou|me\s+chamo|aqui\s*(?:é|e))\s+([A-Za-zÀ-ÖØ-öø-ÿ'´`^~\- ]{2,})",
+    re.IGNORECASE
+)
+
+def _tokenize_words(s: str) -> List[str]:
+    return re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", s or "")
 
 def _sanitize_name(raw: str) -> Optional[str]:
     if not raw:
         return None
-    cleaned = ''.join(ch for ch in raw if ch.isalnum() or ch in " -'´`^~áàãâéêíóôõúüÁÀÃÂÉÊÍÓÔÕÚÜçÇ")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if not cleaned:
+    tokens = [t for t in _tokenize_words(raw) if t]
+    if not tokens:
         return None
-    parts = cleaned.split()
-    if len(parts) >= 2:
-        cleaned = " ".join(parts[:2])
-    else:
-        cleaned = parts[0]
+    # remove saudações comuns no início/fim
+    tokens = [t for t in tokens if _normalize(t) not in _STOPWORDS_GREET]
+    if not tokens:
+        return None
+    # limita a 2 palavras
+    tokens = tokens[:2]
+    name = " ".join(tokens)
     try:
-        cleaned = cleaned.title()
+        name = name.title()
     except Exception:
         pass
-    return cleaned if 2 <= len(cleaned) <= 40 else None
+    # descartes básicos
+    if len(name) < 3 or any(ch.isdigit() for ch in name) or any(ch in "?!@" for ch in name):
+        return None
+    return name
 
-def _extract_name_from_text(text: Optional[str]) -> Optional[str]:
+def _extract_name_from_text(text: Optional[str], *, in_request: bool = False) -> Optional[str]:
+    """Só aceita padrão explícito; se 'in_request'=True, aceita resposta curta tipo 'Matheus'."""
     if not text:
         return None
-    t = text.strip()
-    for rx in _NAME_PATTERNS:
-        m = re.search(rx, _normalize(t), flags=re.IGNORECASE)
-        if m:
-            span = m.span(1)
-            candidate = t[span[0]:span[1]]
-            return _sanitize_name(candidate)
-    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'´`^~\-]{2,}", t)
-    if 1 <= len(tokens) <= 2:
-        return _sanitize_name(" ".join(tokens))
+    # 1) padrão explícito
+    m = _NAME_EXPLICIT_RE.search(text)
+    if m:
+        return _sanitize_name(m.group(1))
+    # 2) se estamos pedindo o nome agora, aceitar resposta curta (ex.: 'Matheus', 'Ana Paula')
+    if in_request:
+        return _sanitize_name(text)
     return None
+
+def _pushname_candidate(push_name: Optional[str]) -> Optional[str]:
+    """Valida pushName do WhatsApp para evitar salvar 'Oi Blz', 'Atendimento', etc."""
+    name = _sanitize_name(push_name or "")
+    if not name:
+        return None
+    toks = [_normalize(t) for t in _tokenize_words(name)]
+    if not toks:
+        return None
+    # se conter saudação óbvia, descarta
+    if any(t in _STOPWORDS_GREET for t in toks):
+        return None
+    # nomes de 1 letra ou siglas curtas são ruins
+    if len(toks) == 1 and len(toks[0]) <= 2:
+        return None
+    return name
 
 # --------- Ações de saída ---------
 
@@ -736,24 +765,19 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 res = await session.execute(select(User).where(User.phone == phone))
                 user = res.scalar_one_or_none()
                 if not user:
-                    user = User(phone=phone, name=push_name or None)
+                    # tenta aproveitar pushName SOB VALIDAÇÃO
+                    pn = _pushname_candidate(push_name)
+                    user = User(phone=phone, name=pn or None)
                     session.add(user)
                     await session.commit()
                     await session.refresh(user)
                 else:
-                    # >>> NOVO: atualiza nome com pushName se ainda não existir
-                    if (not (user.name or "").strip()) and (push_name or "").strip():
-                        user.name = push_name.strip()
-                        await session.commit()
-
-                # >>> NOVO: auto-extrai nome do texto (a qualquer momento) se ainda não temos
-                if msg_type == "text" and text and not (user.name or "").strip():
-                    cand = _extract_name_from_text(text)
-                    if cand:
-                        user.name = cand
-                        await session.commit()
-                        session.add(Message(user_id=user.id, sender="assistant", content=f"[name_captured:{cand}]", media_type="name_captured"))
-                        await session.commit()
+                    # atualiza com pushName válido se ainda não houver nome
+                    if (not (user.name or "").strip()):
+                        pn = _pushname_candidate(push_name)
+                        if pn:
+                            user.name = pn
+                            await session.commit()
 
                 menu_recent          = await _has_recent_menu(session, user.id, minutes=30)
                 video_recent         = await _has_recent_video(session, user.id, minutes=30)
@@ -778,9 +802,9 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         await _enviar_video(session, phone, user)
                         return
 
-                # >>> NOVO 0.1) Se estamos aguardando o NOME (name_request), capture e prossiga ao handoff
+                # 0.1) Estado aguardando NOME
                 if msg_type == "text" and text and name_request_recent and not handoff_recent:
-                    cand = _extract_name_from_text(text)
+                    cand = _extract_name_from_text(text, in_request=True)
                     if cand:
                         user.name = cand
                         await session.commit()
@@ -805,7 +829,16 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         await session.commit()
                         return
 
-                # 0.2) Respostas à OFERTA de handoff (consentimento)
+                # 0.2) Auto-extrai nome somente com padrão explícito (fora do name_request)
+                if msg_type == "text" and text and not (user.name or "").strip():
+                    cand = _extract_name_from_text(text, in_request=False)
+                    if cand:
+                        user.name = cand
+                        await session.commit()
+                        session.add(Message(user_id=user.id, sender="assistant", content=f"[name_captured:{cand}]", media_type="name_captured"))
+                        await session.commit()
+
+                # 0.3) Respostas à OFERTA de handoff (consentimento)
                 if msg_type == "text" and text and handoff_offer_recent and not handoff_recent:
                     if _wants_now(text):
                         # Se não temos nome, pedir antes de notificar
@@ -964,18 +997,21 @@ async def webhook_post(
 
     push_name = _deep_get(payload, "data.data.messages.0.pushName") or _deep_get(payload, "messages.0.pushName")
 
-    # Garante que o usuário exista e, se faltar, atualiza nome com pushName
+    # Garante que o usuário exista e, se faltar, atualiza nome com pushName válido
     res = await db.execute(select(User).where(User.phone == phone))
     user = res.scalar_one_or_none()
     if not user:
-        user = User(phone=phone, name=push_name or None)
+        pn = _pushname_candidate(push_name)
+        user = User(phone=phone, name=pn or None)
         db.add(user)
         await db.commit()
         await db.refresh(user)
     else:
-        if (not (user.name or "").strip()) and (push_name or "").strip():
-            user.name = push_name.strip()
-            await db.commit()
+        if (not (user.name or "").strip()):
+            pn = _pushname_candidate(push_name)
+            if pn:
+                user.name = pn
+                await db.commit()
 
     # ------ DEDUP INBOUND ------
     if await _is_probably_duplicate(db, user.id, text if msg_type == "text" else None, msg_type, window_seconds=5):
