@@ -47,10 +47,8 @@ def _env_template(key: str, default: str = "") -> str:
     raw = os.getenv(key, default) or ""
     raw = raw.strip()
     raw = re.sub(r'^\s*HANDOFF_NOTIFY_TEMPLATE\s*=\s*', '', raw, flags=re.I)
-    # tira aspas de borda se houver
     if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
         raw = raw[1:-1]
-    # normaliza escapes
     raw = raw.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
     return raw
 
@@ -352,9 +350,7 @@ def _is_positive_reply(text: Optional[str]) -> bool:
         return True
     if "video" in t or "vídeo" in t:
         return True
-    # alguns provedores retornam "0" para 1º botão (SIM)
     if t in {"0", "1"}:
-        # assume "0"=sim "1"=não (ordem usual)
         return t == "0"
     return False
 
@@ -366,7 +362,7 @@ def _is_negative_reply(text: Optional[str]) -> bool:
         return True
     if t in _NEGATIVE_WORDS:
         return True
-    if t in {"1"}:  # ver comentário acima
+    if t in {"1"}:
         return True
     return False
 
@@ -386,10 +382,9 @@ def _looks_like_invite(reply_text: str) -> bool:
 
 # --------- NLU leve: formato (evitar pergunta duplicada) ---------
 
-# Mapas canônicos para formatos
 _FORMAT_PATTERNS = {
     "3d/ia": [
-        r"\b3\s*[-/]?\s*d\b",       # 3d | 3-d
+        r"\b3\s*[-/]?\s*d\b",
         r"\b3d\s*ia\b", r"\bia\s*3d\b",
         r"animac(?:ao|ão)\s*3\s*[-/]?\s*d",
     ],
@@ -399,15 +394,12 @@ _FORMAT_PATTERNS = {
     "convite":       [r"\bconvite(?:s)?\b"],
     "homenagem":     [r"\bhomenagem(?:s)?\b", r"\btributo\b"],
 }
-
 _PREFIX_NOISE = r"(?:era|eh|é|foi|quero|queria|pode\s*ser|seria|talvez|acho\s*que)\s+"
 
 def _extract_formato(texto: Optional[str]) -> Optional[str]:
-    """Detecta formato em texto livre (ex.: 'era 3D', 'quero educativo', 'animação 3d')."""
     if not texto:
         return None
     t = _normalize(texto)
-    # remove ruídos iniciais ("era", "quero", ...)
     t = re.sub(rf"^{_PREFIX_NOISE}", "", t)
     for can, patterns in _FORMAT_PATTERNS.items():
         for rx in patterns:
@@ -416,13 +408,11 @@ def _extract_formato(texto: Optional[str]) -> Optional[str]:
     return None
 
 def _looks_like_format_question(texto: Optional[str]) -> bool:
-    """Heurística: identifica se a IA está perguntando sobre formato."""
     if not texto:
         return False
     t = _normalize(texto)
     if "qual formato" in t or "formato te interessa" in t or "formato voce" in t or "formato você" in t:
         return True
-    # pergunta listando opções conhecidas
     if "3d" in t or "institucional" in t or "educativo" in t or "produto" in t or "convite" in t or "homenagem" in t:
         if "formato" in t:
             return True
@@ -486,6 +476,18 @@ def _parse_tool_hints(reply_text: str) -> Tuple[bool, bool, bool]:
     wants_video = ("video" in tags) or ("enviar_video" in (reply_text or "").lower())
     wants_handoff = ("handoff" in tags) or _looks_like_handoff(reply_text)
     return (wants_menu, wants_video, wants_handoff)
+
+# --------------------- Locks por usuário (evita corridas) ---------------------
+
+_USER_LOCKS: Dict[str, asyncio.Lock] = {}
+
+def _get_user_lock(phone: str) -> asyncio.Lock:
+    key = _only_digits(phone or "")
+    lock = _USER_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _USER_LOCKS[key] = lock
+    return lock
 
 # --------- Handoff helpers ---------
 
@@ -583,7 +585,6 @@ async def _enviar_video(session: AsyncSession, phone: str, user: User) -> None:
             session.add(Message(user_id=user.id, sender="assistant", content=LUNA_VIDEO_AFTER_TEXT, media_type="text"))
             await session.commit()
     except Exception as exc:
-        # fallback duro: manda link em texto
         print(f"[video] falha ao enviar vídeo nativo: {exc!r} — enviando link em texto.")
         fallback_text = (LUNA_VIDEO_CAPTION + "\n" if LUNA_VIDEO_CAPTION else "") + f"{LUNA_VIDEO_URL}"
         try:
@@ -625,130 +626,131 @@ async def get_verify(
 # --------------------------- processamento assíncrono ---------------------------
 async def _process_message_async(phone: str, msg_type: str, text: Optional[str], push_name: Optional[str]) -> None:
     """Processa a mensagem fora do ciclo do request para evitar timeouts/499."""
-    try:
-        async with SessionLocal() as session:
-            res = await session.execute(select(User).where(User.phone == phone))
-            user = res.scalar_one_or_none()
-            if not user:
-                user = User(phone=phone, name=push_name or None)
-                session.add(user)
-                await session.commit()
-                await session.refresh(user)
+    # SERIALIZA por usuário para evitar corridas de duplicatas
+    async with _get_user_lock(phone):
+        try:
+            async with SessionLocal() as session:
+                res = await session.execute(select(User).where(User.phone == phone))
+                user = res.scalar_one_or_none()
+                if not user:
+                    user = User(phone=phone, name=push_name or None)
+                    session.add(user)
+                    await session.commit()
+                    await session.refresh(user)
 
-            menu_recent    = await _has_recent_menu(session, user.id, minutes=30)
-            video_recent   = await _has_recent_video(session, user.id, minutes=30)
-            handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)
+                menu_recent    = await _has_recent_menu(session, user.id, minutes=30)
+                video_recent   = await _has_recent_video(session, user.id, minutes=30)
+                handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)
 
-            # 0) Se houve caixinha recente, trate SIM/NÃO localmente (sem IA).
-            if msg_type == "text" and text and menu_recent:
-                # NEGATIVO: sempre encerra
-                if _is_negative_reply(text):
-                    end_text = LUNA_END_TEXT or "Tudo bem! Se precisar depois, estou por aqui. 🌟"
+                # 0) Se houve caixinha recente, trate SIM/NÃO localmente (sem IA).
+                if msg_type == "text" and text and menu_recent:
+                    # NEGATIVO: encerra na hora
+                    if _is_negative_reply(text):
+                        end_text = LUNA_END_TEXT or "Tudo bem! Se precisar depois, estou por aqui. 🌟"
+                        try:
+                            await send_whatsapp_message(phone=phone, content=end_text, type_="text")
+                        except Exception as e:
+                            print(f"[uazapi] send end_text failed (bg): {e!r}")
+                        session.add(Message(user_id=user.id, sender="assistant", content=end_text, media_type="text"))
+                        await session.commit()
+                        return
+                    # POSITIVO: só envia vídeo se AINDA não houve envio recente;
+                    # se já houve, NÃO retorna — deixa seguir para a IA.
+                    if _is_positive_reply(text):
+                        if not video_recent:
+                            await _enviar_video(session, phone, user)
+                            return
+                        else:
+                            print("[guard] vídeo já enviado recentemente; ignorando novo 'sim' e seguindo para a IA.")
+
+                # 1) Texto -> consulta IA (com CONTEXTO do estado + PHONE)
+                if msg_type == "text" and text:
+                    thread_id = await get_or_create_thread(session, user)
+
+                    digits_phone = _only_digits(phone or "")
+                    meta_phone = f"(meta: phone_do_lead:+{digits_phone}. Ao chamar tools use este valor no parâmetro 'phone'.) "
+
+                    # NLU leve: detectar formato informado pelo usuário para evitar repergunta
+                    user_formato = _extract_formato(text or "")
+
+                    prefix = ""
+                    if video_recent:
+                        prefix = (
+                            "Contexto: o lead acabou de receber o vídeo demonstrativo da Verbo Vídeo. "
+                            "Prossiga com a etapa seguinte do fluxo (pós-vídeo). Mensagem do lead: "
+                        )
+                    elif menu_recent:
+                        tnorm = _normalize(text)
+                        if tnorm in {_normalize(LUNA_MENU_YES), "sim"} or "sim" in tnorm:
+                            prefix = "Contexto: o lead respondeu SIM na caixinha de interesse. Mensagem do lead: "
+                        elif tnorm in {_normalize(LUNA_MENU_NO), "nao", "não"} or "nao" in tnorm or "não" in tnorm:
+                            prefix = "Contexto: o lead respondeu NÃO na caixinha de interesse. Mensagem do lead: "
+                        else:
+                            prefix = "Contexto: foi enviada uma caixinha de interesse ao lead. Mensagem do lead: "
+
+                    ai_input = (meta_phone + prefix + (text or "")).strip()
+
+                    if user_formato:
+                        ai_input += f" [contexto_formato: o lead já indicou o formato '{user_formato}'. Não repita a pergunta de formato; confirme e avance.]"
+
+                    reply_text = await ask_assistant(thread_id, ai_input) or ""
+                    raw_reply_for_tools = reply_text
+
+                    if user_formato and _looks_like_format_question(reply_text):
+                        reply_text = f"Perfeito, anotei: **{user_formato}**. Vamos avançar para os próximos passos?"
+
+                    wants_menu, wants_video, wants_handoff = _parse_tool_hints(raw_reply_for_tools)
+
+                    # 1.a) Se a IA pediu caixinha/convite
+                    if (wants_menu or _looks_like_invite(raw_reply_for_tools)) and not menu_recent:
+                        await _enviar_menu(session, phone, user)
+                        return
+                    if (wants_menu or _looks_like_invite(raw_reply_for_tools)) and menu_recent:
+                        print("[guard] IA/convite pediu caixinha, mas já existe recente; ignorando convite.")
+
+                    # 1.b) Se a IA pediu VÍDEO
+                    if wants_video and not video_recent:
+                        await _enviar_video(session, phone, user)
+                        return
+                    if wants_video and video_recent:
+                        print("[guard] IA pediu vídeo, mas já enviamos recentemente; ignorando.")
+
+                    # 1.c) HANDOFF: notificar consultores (uma vez por janela)
+                    if wants_handoff and not handoff_recent:
+                        await _notify_consultants(session, user=user, phone=phone, user_text=text)
+
+                    # 1.d) Fallback opcional — vídeo após SIM na caixinha (se IA não mandou)
+                    if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
+                        await _enviar_video(session, phone, user)
+                        return
+
+                    # 1.e) Anti-eco (convite) após caixinha
+                    if menu_recent and _looks_like_invite(raw_reply_for_tools):
+                        print("[guard] menu enviado há pouco; suprimindo texto convite duplicado.")
+                        return
+
+                    # 1.f) Texto normal para o lead (SEM as tags #tools(...))
+                    clean_text = _strip_tool_tags(reply_text) or "Certo!"
                     try:
-                        await send_whatsapp_message(phone=phone, content=end_text, type_="text")
+                        await send_whatsapp_message(phone=phone, content=clean_text, type_="text")
                     except Exception as e:
-                        print(f"[uazapi] send end_text failed (bg): {e!r}")
-                    session.add(Message(user_id=user.id, sender="assistant", content=end_text, media_type="text"))
+                        print(f"[uazapi] send failed (bg): {e!r}")
+
+                    session.add(Message(user_id=user.id, sender="assistant", content=clean_text, media_type="text"))
                     await session.commit()
                     return
-                # POSITIVO: só envia vídeo se AINDA não houve envio recente; caso contrário, deixa seguir para a IA.
-                if _is_positive_reply(text) and not video_recent:
-                    await _enviar_video(session, phone, user)
-                    return
 
-            # 1) Texto -> consulta IA (com CONTEXTO do estado + PHONE)
-            if msg_type == "text" and text:
-                thread_id = await get_or_create_thread(session, user)
-
-                digits_phone = _only_digits(phone or "")
-                meta_phone = f"(meta: phone_do_lead:+{digits_phone}. Ao chamar tools use este valor no parâmetro 'phone'.) "
-
-                # >>> NLU leve: detectar formato informado pelo usuário para evitar repergunta
-                user_formato = _extract_formato(text or "")
-
-                prefix = ""
-                if video_recent:
-                    prefix = (
-                        "Contexto: o lead acabou de receber o vídeo demonstrativo da Verbo Vídeo. "
-                        "Prossiga com a etapa seguinte do fluxo (pós-vídeo). Mensagem do lead: "
-                    )
-                elif menu_recent:
-                    tnorm = _normalize(text)
-                    if tnorm in {_normalize(LUNA_MENU_YES), "sim"} or "sim" in tnorm:
-                        prefix = "Contexto: o lead respondeu SIM na caixinha de interesse. Mensagem do lead: "
-                    elif tnorm in {_normalize(LUNA_MENU_NO), "nao", "não"} or "nao" in tnorm or "não" in tnorm:
-                        prefix = "Contexto: o lead respondeu NÃO na caixinha de interesse. Mensagem do lead: "
-                    else:
-                        prefix = "Contexto: foi enviada uma caixinha de interesse ao lead. Mensagem do lead: "
-
-                ai_input = (meta_phone + prefix + (text or "")).strip()
-
-                # Injeta instrução para NÃO repetir pergunta de formato se já identificado
-                if user_formato:
-                    ai_input += f" [contexto_formato: o lead já indicou o formato '{user_formato}'. Não repita a pergunta de formato; confirme e avance.]"
-
-                reply_text = await ask_assistant(thread_id, ai_input) or ""
-
-                # Guarda o texto bruto para detectar tool-hints antes de qualquer ajuste
-                raw_reply_for_tools = reply_text
-
-                # Se a IA insistir em perguntar formato mas nós já temos, substitui por confirmação
-                if user_formato and _looks_like_format_question(reply_text):
-                    reply_text = f"Perfeito, anotei: **{user_formato}**. Vamos avançar para os próximos passos?"
-
-                wants_menu, wants_video, wants_handoff = _parse_tool_hints(raw_reply_for_tools)
-
-                # 1.a) Se a IA pediu caixinha/convite
-                if (wants_menu or _looks_like_invite(raw_reply_for_tools)) and not menu_recent:
-                    await _enviar_menu(session, phone, user)
-                    return
-                if (wants_menu or _looks_like_invite(raw_reply_for_tools)) and menu_recent:
-                    print("[guard] IA/convite pediu caixinha, mas já existe recente; ignorando convite.")
-
-                # 1.b) Se a IA pediu VÍDEO
-                if wants_video and not video_recent:
-                    await _enviar_video(session, phone, user)
-                    return
-                if wants_video and video_recent:
-                    print("[guard] IA pediu vídeo, mas já enviamos recentemente; ignorando.")
-
-                # 1.c) HANDOFF: notificar consultores (uma vez por janela)
-                if wants_handoff and not handoff_recent:
-                    await _notify_consultants(session, user=user, phone=phone, user_text=text)
-                    # segue respondendo ao lead com o próprio reply_text da IA
-
-                # 1.d) Fallback opcional — vídeo após SIM na caixinha (se IA não mandou)
-                if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
-                    await _enviar_video(session, phone, user)
-                    return
-
-                # 1.e) Anti-eco (convite) após caixinha
-                if menu_recent and _looks_like_invite(raw_reply_for_tools):
-                    print("[guard] menu enviado há pouco; suprimindo texto convite duplicado.")
-                    return
-
-                # 1.f) Texto normal para o lead (SEM as tags #tools(...))
-                clean_text = _strip_tool_tags(reply_text) or "Certo!"
+                # 2) Mensagens não-texto
+                ack = "Arquivo recebido com sucesso. Já estou processando! ✅"
                 try:
-                    await send_whatsapp_message(phone=phone, content=clean_text, type_="text")
+                    await send_whatsapp_message(phone=phone, content=ack, type_="text")
                 except Exception as e:
                     print(f"[uazapi] send failed (bg): {e!r}")
-
-                session.add(Message(user_id=user.id, sender="assistant", content=clean_text, media_type="text"))
+                session.add(Message(user_id=user.id, sender="assistant", content=ack, media_type="text"))
                 await session.commit()
-                return
 
-            # 2) Mensagens não-texto
-            ack = "Arquivo recebido com sucesso. Já estou processando! ✅"
-            try:
-                await send_whatsapp_message(phone=phone, content=ack, type_="text")
-            except Exception as e:
-                print(f"[uazapi] send failed (bg): {e!r}")
-            session.add(Message(user_id=user.id, sender="assistant", content=ack, media_type="text"))
-            await session.commit()
-
-    except Exception as exc:
-        print(f"[bg] unexpected error: {exc!r}")
+        except Exception as exc:
+            print(f"[bg] unexpected error: {exc!r}")
 
 # --------------------------- webhook ---------------------------
 @router.post("")
