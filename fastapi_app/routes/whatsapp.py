@@ -6,8 +6,8 @@ Fluxo resumido:
 - Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints por texto ou por tag #tools()).
 - Atalho local: após a caixinha, interpreta SIM/NÃO sem chamar a IA (responde na hora).
 - Fallback opcional: vídeo após SIM na caixinha (configurável).
-- Handoff: quando a IA sinaliza (função/texto), notifica consultores em outro chat.
-- Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações.
+- Handoff: agora é por CONSENTIMENTO — só notifica consultores após o lead aceitar.
+- Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações + lock por usuário.
 """
 
 from __future__ import annotations
@@ -40,13 +40,13 @@ def _env_str(key: str, default: str = "") -> str:
 def _env_template(key: str, default: str = "") -> str:
     """
     Lê um template de ENV e normaliza:
-      - remove prefixo acidental "HANDOFF_NOTIFY_TEMPLATE=" se o usuário colou junto
+      - remove prefixo acidental "<KEY>=" se o usuário colou junto
       - retira aspas de borda
       - converte literais \n, \r, \t em quebras reais
     """
     raw = os.getenv(key, default) or ""
     raw = raw.strip()
-    raw = re.sub(r'^\s*HANDOFF_NOTIFY_TEMPLATE\s*=\s*', '', raw, flags=re.I)
+    raw = re.sub(rf'^\s*{re.escape(key)}\s*=\s*', '', raw, flags=re.I)
     if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
         raw = raw[1:-1]
     raw = raw.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
@@ -72,6 +72,23 @@ HANDOFF_NOTIFY_TEMPLATE = _env_template(
     "Novo lead aguardando contato (Luna — Verbo Vídeo)\n"
     "Nome: {name}\nTelefone: +{digits}\nÚltima mensagem: {last}\nOrigem: WhatsApp\n"
     "Link: {wa_link}"
+)
+
+# NOVO: mensagens do convite/consentimento de handoff
+HANDOFF_CONSULTOR_NAME   = _env_str("HANDOFF_CONSULTOR_NAME", "nosso consultor criativo")
+HANDOFF_OFFER_TEMPLATE   = _env_template(
+    "HANDOFF_OFFER_TEMPLATE",
+    "Perfeito, anotei: *{formato}*. "
+    "Posso te passar para {consultor}, que pode mostrar formatos e orçamentos sob medida? "
+    "Prefere que ele fale agora ou mais tarde?"
+)
+HANDOFF_CONFIRM_TEMPLATE = _env_template(
+    "HANDOFF_CONFIRM_TEMPLATE",
+    "Perfeito! Estou te passando para {consultor} agora. Ele vai te chamar neste número em instantes. 👍"
+)
+HANDOFF_LATER_TEMPLATE   = _env_template(
+    "HANDOFF_LATER_TEMPLATE",
+    "Combinado! Aviso {consultor}. Quando quiser falar **agora**, diga “agora” aqui que eu aciono."
 )
 
 # --------------------------- Auth helpers ---------------------------
@@ -338,6 +355,9 @@ async def _has_recent_video(session: AsyncSession, user_id: int, minutes: int = 
 async def _has_recent_handoff(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "handoff", minutes)
 
+async def _has_recent_handoff_offer(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
+    return await _has_recent_generic(session, user_id, "handoff_offer", minutes)
+
 def _is_positive_reply(text: Optional[str]) -> bool:
     if not text:
         return False
@@ -365,6 +385,19 @@ def _is_negative_reply(text: Optional[str]) -> bool:
     if t in {"1"}:
         return True
     return False
+
+# Handoff: distinção entre "agora" e "mais tarde"
+def _wants_now(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    t = _normalize(text)
+    return ("agora" in t) or (t in {"sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim"})
+
+def _wants_later(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    t = _normalize(text)
+    return any(p in t for p in ("mais tarde", "depois", "amanha", "amanhã"))
 
 _INVITE_PATTERNS = (
     "quer ver em 30", "quer ver em 30s", "quer ver em 30 s",
@@ -545,6 +578,19 @@ async def _notify_consultants(session: AsyncSession, *, user: User, phone: str, 
     session.add(Message(user_id=user.id, sender="assistant", content=alert, media_type="handoff"))
     await session.commit()
 
+def _offer_text(formato: Optional[str]) -> str:
+    fmt = (formato or "o formato desejado")
+    return HANDOFF_OFFER_TEMPLATE.format(formato=fmt, consultor=HANDOFF_CONSULTOR_NAME)
+
+async def _send_handoff_offer(session: AsyncSession, *, phone: str, user: User, formato: Optional[str]) -> None:
+    text = _offer_text(formato)
+    try:
+        await send_whatsapp_message(phone=phone, content=text, type_="text")
+    except Exception as e:
+        print(f"[handoff] falha ao enviar oferta: {e!r}")
+    session.add(Message(user_id=user.id, sender="assistant", content=text, media_type="handoff_offer"))
+    await session.commit()
+
 # --------- Ações de saída ---------
 
 async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
@@ -638,9 +684,10 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     await session.commit()
                     await session.refresh(user)
 
-                menu_recent    = await _has_recent_menu(session, user.id, minutes=30)
-                video_recent   = await _has_recent_video(session, user.id, minutes=30)
-                handoff_recent = await _has_recent_handoff(session, user.id, minutes=30)
+                menu_recent         = await _has_recent_menu(session, user.id, minutes=30)
+                video_recent        = await _has_recent_video(session, user.id, minutes=30)
+                handoff_recent      = await _has_recent_handoff(session, user.id, minutes=30)
+                handoff_offer_recent= await _has_recent_handoff_offer(session, user.id, minutes=30)
 
                 # 0) Se houve caixinha recente, trate SIM/NÃO localmente (sem IA).
                 if msg_type == "text" and text and menu_recent:
@@ -656,12 +703,35 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         return
                     # POSITIVO: só envia vídeo se AINDA não houve envio recente;
                     # se já houve, NÃO retorna — deixa seguir para a IA.
-                    if _is_positive_reply(text):
-                        if not video_recent:
-                            await _enviar_video(session, phone, user)
-                            return
-                        else:
-                            print("[guard] vídeo já enviado recentemente; ignorando novo 'sim' e seguindo para a IA.")
+                    if _is_positive_reply(text) and not video_recent:
+                        await _enviar_video(session, phone, user)
+                        return
+
+                # 0.1) Se já enviamos uma OFERTA de handoff, interpretamos a resposta do lead aqui.
+                if msg_type == "text" and text and handoff_offer_recent and not handoff_recent:
+                    if _wants_now(text):
+                        try:
+                            ack = HANDOFF_CONFIRM_TEMPLATE.format(consultor=HANDOFF_CONSULTOR_NAME)
+                        except Exception:
+                            ack = f"Perfeito! Estou te passando para {HANDOFF_CONSULTOR_NAME} agora."
+                        try:
+                            await send_whatsapp_message(phone=phone, content=ack, type_="text")
+                        except Exception as e:
+                            print(f"[handoff] falha ao enviar confirmação: {e!r}")
+                        session.add(Message(user_id=user.id, sender="assistant", content=ack, media_type="text"))
+                        await session.commit()
+                        await _notify_consultants(session, user=user, phone=phone, user_text=text)
+                        return
+                    if _wants_later(text):
+                        msg = HANDOFF_LATER_TEMPLATE.format(consultor=HANDOFF_CONSULTOR_NAME)
+                        try:
+                            await send_whatsapp_message(phone=phone, content=msg, type_="text")
+                        except Exception:
+                            pass
+                        session.add(Message(user_id=user.id, sender="assistant", content=msg, media_type="text"))
+                        await session.commit()
+                        return
+                    # Se não ficou claro (ex.: "talvez"), segue para IA.
 
                 # 1) Texto -> consulta IA (com CONTEXTO do estado + PHONE)
                 if msg_type == "text" and text:
@@ -670,7 +740,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     digits_phone = _only_digits(phone or "")
                     meta_phone = f"(meta: phone_do_lead:+{digits_phone}. Ao chamar tools use este valor no parâmetro 'phone'.) "
 
-                    # NLU leve: detectar formato informado pelo usuário para evitar repergunta
+                    # NLU leve: detectar formato informado pelo usuário para dirigir o próximo passo
                     user_formato = _extract_formato(text or "")
 
                     prefix = ""
@@ -690,12 +760,14 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
                     ai_input = (meta_phone + prefix + (text or "")).strip()
 
+                    # Sugestão para IA: se já temos formato, não perguntar de novo
                     if user_formato:
                         ai_input += f" [contexto_formato: o lead já indicou o formato '{user_formato}'. Não repita a pergunta de formato; confirme e avance.]"
 
                     reply_text = await ask_assistant(thread_id, ai_input) or ""
                     raw_reply_for_tools = reply_text
 
+                    # Se a IA insistir em perguntar formato mas nós já temos, substitui por confirmação
                     if user_formato and _looks_like_format_question(reply_text):
                         reply_text = f"Perfeito, anotei: **{user_formato}**. Vamos avançar para os próximos passos?"
 
@@ -715,9 +787,12 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     if wants_video and video_recent:
                         print("[guard] IA pediu vídeo, mas já enviamos recentemente; ignorando.")
 
-                    # 1.c) HANDOFF: notificar consultores (uma vez por janela)
-                    if wants_handoff and not handoff_recent:
-                        await _notify_consultants(session, user=user, phone=phone, user_text=text)
+                    # 1.c) Handoff por CONSENTIMENTO:
+                    #     - Se a IA pediu handoff OU o usuário já informou formato,
+                    #       primeiro ofertamos o handoff (se ainda não ofertado/feito).
+                    if (wants_handoff or user_formato) and not (handoff_recent or handoff_offer_recent):
+                        await _send_handoff_offer(session, phone=phone, user=user, formato=user_formato)
+                        return
 
                     # 1.d) Fallback opcional — vídeo após SIM na caixinha (se IA não mandou)
                     if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
