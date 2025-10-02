@@ -134,12 +134,25 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
 
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
+# ADIÇÃO: prioriza selectedDisplayText dos botões antes dos IDs
 TEXT_KEYS_PRIORITY = (
     # Baileys-like / variados
     "data.data.messages.0.message.conversation",
     "data.data.messages.0.message.extendedTextMessage.text",
     "messages.0.message.conversation",
     "messages.0.message.extendedTextMessage.text",
+
+    # Respostas de botões (display text primeiro)
+    "messages.0.message.buttonsResponseMessage.selectedDisplayText",
+    "data.data.messages.0.message.buttonsResponseMessage.selectedDisplayText",
+    "messages.0.message.templateButtonReplyMessage.selectedDisplayText",
+    "data.data.messages.0.message.templateButtonReplyMessage.selectedDisplayText",
+
+    # IDs de botões/listas
+    "messages.0.message.buttonsResponseMessage.selectedButtonId",
+    "data.data.messages.0.message.buttonsResponseMessage.selectedButtonId",
+    "messages.0.message.listResponseMessage.title",
+
     # Uazapi simples
     "messages.0.text",
     "data.text",
@@ -150,12 +163,6 @@ TEXT_KEYS_PRIORITY = (
     "body",
     "content",
     "caption",
-    # respostas de botões/listas (variações)
-    "messages.0.message.templateButtonReplyMessage.selectedDisplayText",
-    "messages.0.message.buttonsResponseMessage.selectedButtonId",
-    "messages.0.message.listResponseMessage.title",
-    "data.data.messages.0.message.buttonsResponseMessage.selectedButtonId",
-    "data.data.messages.0.message.templateButtonReplyMessage.selectedDisplayText",
 )
 
 def _only_digits(s: str) -> str:
@@ -169,6 +176,13 @@ def _strip_accents(s: str) -> str:
 
 def _normalize(s: str) -> str:
     return _strip_accents((s or "").strip().lower())
+
+def _normalize_soft(s: str) -> str:
+    """lower + remove acentos + remove pontuação (mantém espaços)"""
+    t = _normalize(s)
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 def _deep_get(dct: Dict[str, Any], path: str, default=None):
     cur: Any = dct
@@ -339,6 +353,15 @@ _POSITIVE_WORDS = {
 _NEGATIVE_WORDS = {"nao", "não", "nao obrigado", "não obrigado", "pode encerrar", "parar", "cancelar", "encerre"}
 _POSITIVE_EMOJIS = {"👍", "👌", "✅", "✔️", "✌️", "🤝"}
 
+# tokens canônicos usados pelo matcher de SIM/NÃO
+_YES_TOKENS = {
+    "sim", "ok", "okay", "claro", "perfeito", "pode", "agora", "continuar", "prosseguir",
+    "segue", "manda", "enviar", "mostrar", "yes", "y", "s"
+}
+_NO_TOKENS = {
+    "nao", "não", "no", "n", "parar", "cancelar", "encerrar", "encerrarcontato", "recusar"
+}
+
 async def _has_recent_generic(session: AsyncSession, user_id: int, media_type: str, minutes: int) -> bool:
     try:
         q = (
@@ -379,28 +402,41 @@ async def _has_recent_name_request(session: AsyncSession, user_id: int, minutes:
 def _is_positive_reply(text: Optional[str]) -> bool:
     if not text:
         return False
-    t = _normalize(text)
-    if t in {_normalize(LUNA_MENU_YES), "sim"}:
+    t = _normalize_soft(text)
+    if not t:
+        return False
+    # aceita IDs/flags comuns
+    if t in {"0", "yes"}:
         return True
-    if t in _POSITIVE_WORDS:
+    # confere por containment com o rótulo do botão do ENV
+    ly = _normalize_soft(LUNA_MENU_YES)
+    if ly and (t == ly or ly in t):
         return True
-    if any(e in text for e in _POSITIVE_EMOJIS):
+    # tokens
+    toks = set(re.findall(r"[a-z0-9]+", t))
+    if toks & _YES_TOKENS:
         return True
-    if "video" in t or "vídeo" in t:
+    # emojis
+    if any(e in (text or "") for e in _POSITIVE_EMOJIS):
         return True
-    if t in {"0", "1"}:
-        return t == "0"
+    # fallback gentil (ex.: menciona “vídeo”)
+    if "video" in t:
+        return True
     return False
 
 def _is_negative_reply(text: Optional[str]) -> bool:
     if not text:
         return False
-    t = _normalize(text)
-    if t in {_normalize(LUNA_MENU_NO), "nao", "não"}:
+    t = _normalize_soft(text)
+    if not t:
+        return False
+    if t in {"1", "no", "nao", "não"}:
         return True
-    if t in _NEGATIVE_WORDS:
+    ln = _normalize_soft(LUNA_MENU_NO)
+    if ln and (t == ln or ln in t):
         return True
-    if t in {"1"}:
+    toks = set(re.findall(r"[a-z0-9]+", t))
+    if toks & _NO_TOKENS:
         return True
     return False
 
@@ -408,14 +444,14 @@ def _is_negative_reply(text: Optional[str]) -> bool:
 def _wants_now(text: Optional[str]) -> bool:
     if not text:
         return False
-    t = _normalize(text)
-    return ("agora" in t) or (t in {"sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim"})
+    t = _normalize_soft(text)
+    return ("agora" in t) or (t in {"sim", "ok", "okay", "claro", "perfeito", "pode", "podesim"})
 
 def _wants_later(text: Optional[str]) -> bool:
     if not text:
         return False
-    t = _normalize(text)
-    return any(p in t for p in ("mais tarde", "depois", "amanha", "amanhã"))
+    t = _normalize_soft(text)
+    return any(p in t for p in ("maistarde", "depois", "amanha", "amanhã"))
 
 _INVITE_PATTERNS = (
     "quer ver em 30", "quer ver em 30s", "quer ver em 30 s",
@@ -742,7 +778,7 @@ async def _enviar_menu(session: AsyncSession, phone: str, user: User) -> None:
         )
         session.add(Message(user_id=user.id, sender="assistant", content=LUNA_MENU_TEXT, media_type="menu"))
         await session.commit()
-        print("[menu] enviado com sucesso].")
+        print("[menu] enviado com sucesso.")
     except Exception as exc:
         print(f"[menu] falha ao enviar menu: {exc!r}")
 
