@@ -1,14 +1,12 @@
-"""
-Webhook e endpoints para WhatsApp (Uazapi).
-
-Fluxo resumido:
-- Encaminha texto do lead para a IA (Assistant) COM contexto de estado (caixinha/vídeo) + phone do lead.
-- Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints por texto ou por tag #tools()).
-- Atalho local: após a caixinha, interpreta SIM/NÃO sem chamar a IA (responde na hora).
-- Fallback opcional: vídeo após SIM na caixinha (configurável).
-- Handoff: agora é por CONSENTIMENTO — só notifica consultores após o lead aceitar.
-- Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações + lock por usuário.
-"""
+# Webhook e endpoints para WhatsApp (Uazapi).
+#
+# Fluxo resumido:
+# - Encaminha texto do lead para a IA (Assistant) COM contexto de estado (caixinha/vídeo) + phone do lead.
+# - Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints por texto ou por tag #tools()).
+# - Atalho local: após a caixinha, interpreta SIM/NÃO sem chamar a IA (responde na hora).
+# - Fallback opcional: vídeo após SIM na caixinha (configurável).
+# - Handoff: agora é por CONSENTIMENTO — só notifica consultores após o lead aceitar.
+# - Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações + lock por usuário.
 
 from __future__ import annotations
 
@@ -344,23 +342,12 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
 # --------------------------- Fluxo helpers ---------------------------
 
-_POSITIVE_WORDS = {
-    "sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim", "pode continuar",
-    "vamos", "bora", "manda", "mande", "envia", "enviar", "segue", "segue sim",
-    "quero", "tenho interesse", "interessa", "top", "show", "positivo", "agora",
-    "mais tarde", "sim pode", "pode mandar", "pode enviar", "pode mostrar",
-}
-_NEGATIVE_WORDS = {"nao", "não", "nao obrigado", "não obrigado", "pode encerrar", "parar", "cancelar", "encerre"}
 _POSITIVE_EMOJIS = {"👍", "👌", "✅", "✔️", "✌️", "🤝"}
 
 # tokens canônicos usados pelo matcher de SIM/NÃO
-_YES_TOKENS = {
-    "sim", "ok", "okay", "claro", "perfeito", "pode", "agora", "continuar", "prosseguir",
-    "segue", "manda", "enviar", "mostrar", "yes", "y", "s"
-}
-_NO_TOKENS = {
-    "nao", "não", "no", "n", "parar", "cancelar", "encerrar", "encerrarcontato", "recusar"
-}
+_YES_TOKENS = {"sim", "ok", "okay", "claro", "perfeito", "pode", "agora", "continuar", "prosseguir",
+               "segue", "manda", "enviar", "mostrar", "yes", "y", "s"}
+_NO_TOKENS  = {"nao", "não", "no", "n", "parar", "cancelar", "encerrar", "encerrarcontato", "recusar"}
 
 async def _has_recent_generic(session: AsyncSession, user_id: int, media_type: str, minutes: int) -> bool:
     try:
@@ -386,6 +373,9 @@ async def _has_recent_generic(session: AsyncSession, user_id: int, media_type: s
 async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "menu", minutes)
 
+async def _has_recent_menu_ack(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
+    return await _has_recent_generic(session, user_id, "menu_ack", minutes)
+
 async def _has_recent_video(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "video", minutes)
 
@@ -395,9 +385,20 @@ async def _has_recent_handoff(session: AsyncSession, user_id: int, minutes: int 
 async def _has_recent_handoff_offer(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "handoff_offer", minutes)
 
-# estado "name_request" (quando pedimos o nome)
-async def _has_recent_name_request(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
-    return await _has_recent_generic(session, user_id, "name_request", minutes)
+def _is_menu_click_payload(text: Optional[str]) -> bool:
+    """Retorna True se 'text' parece ser apenas o payload de um clique (0/1/labels do ENV)."""
+    if not text:
+        return False
+    t = _normalize_soft(text)
+    if t in {"0", "1"}:
+        return True
+    ly = _normalize_soft(LUNA_MENU_YES)
+    ln = _normalize_soft(LUNA_MENU_NO)
+    if ly and (t == ly or ly in t):
+        return True
+    if ln and (t == ln or ln in t):
+        return True
+    return False
 
 def _is_positive_reply(text: Optional[str]) -> bool:
     if not text:
@@ -439,33 +440,6 @@ def _is_negative_reply(text: Optional[str]) -> bool:
     if toks & _NO_TOKENS:
         return True
     return False
-
-# Handoff: distinção entre "agora" e "mais tarde"
-def _wants_now(text: Optional[str]) -> bool:
-    if not text:
-        return False
-    t = _normalize_soft(text)
-    return ("agora" in t) or (t in {"sim", "ok", "okay", "claro", "perfeito", "pode", "podesim"})
-
-def _wants_later(text: Optional[str]) -> bool:
-    if not text:
-        return False
-    t = _normalize_soft(text)
-    return any(p in t for p in ("maistarde", "depois", "amanha", "amanhã"))
-
-_INVITE_PATTERNS = (
-    "quer ver em 30", "quer ver em 30s", "quer ver em 30 s",
-    "30 seg", "30seg", "30 segundos", "trinta segundos",
-    "posso te mostrar", "posso apresentar um case", "exemplo objetivo",
-    "te mostro em 30", "posso enviar um exemplo", "quer ver um exemplo",
-    "apresentar um case curto"
-)
-
-def _looks_like_invite(reply_text: str) -> bool:
-    if not reply_text:
-        return False
-    t = _normalize(reply_text)
-    return any(p in t for p in _INVITE_PATTERNS)
 
 # --------- NLU leve: formato (evitar pergunta duplicada) ---------
 
@@ -657,7 +631,6 @@ _BAD_NAME_TOKENS = {
     "pac","lead","empresa","marketing","verbo","video","vídeo","luna"
 }
 
-# padrão explícito no TEXTO original (não normalizado)
 _NAME_EXPLICIT_RE = re.compile(
     r"(?:meu\s+nome\s*(?:é|e)|nome\s*:|sou|me\s+chamo|aqui\s*(?:é|e))\s+([A-Za-zÀ-ÖØ-öø-ÿ'´`^~\- ]{2,})",
     re.IGNORECASE
@@ -672,11 +645,10 @@ def _sanitize_name(raw: str) -> Optional[str]:
     tokens = [t for t in _tokenize_words(raw) if t]
     if not tokens:
         return None
-    # remove saudações comuns
     tokens = [t for t in tokens if _normalize(t) not in _STOPWORDS_GREET]
     if not tokens:
         return None
-    tokens = tokens[:2]  # no máximo 2 palavras
+    tokens = tokens[:2]
     name = " ".join(tokens)
     try:
         name = name.title()
@@ -700,30 +672,24 @@ def _is_bad_name(name: Optional[str]) -> bool:
     return False
 
 def _pushname_candidate(push_name: Optional[str]) -> Optional[str]:
-    """Valida pushName do WhatsApp para evitar salvar 'Oi Blz', 'Atendimento', etc."""
     name = _sanitize_name(push_name or "")
     if not name or _is_bad_name(name):
         return None
-    # evita nomes de 1–2 letras
     toks = _tokenize_words(name)
     if len(toks) == 1 and len(toks[0]) <= 2:
         return None
     return name
 
 def _extract_name_from_text(text: Optional[str], *, in_request: bool = False) -> Optional[str]:
-    """Aceita padrão explícito; se 'in_request'=True, aceita resposta curta (ex.: 'Matheus')."""
     if not text:
         return None
-    # 1) padrão explícito sempre
     m = _NAME_EXPLICIT_RE.search(text)
     if m:
         return _sanitize_name(m.group(1))
-    # 2) quando for resposta a um pedido de nome, aceitar direto 1–2 tokens
     if in_request:
         return _sanitize_name(text)
     return None
 
-# Detecta se a assistente perguntou o nome recentemente
 _NAME_ASK_PATTERNS = (
     "com quem estou falando",
     "posso saber com quem estou falando",
@@ -843,21 +809,18 @@ async def get_verify(
 # --------------------------- processamento assíncrono ---------------------------
 async def _process_message_async(phone: str, msg_type: str, text: Optional[str], push_name: Optional[str]) -> None:
     """Processa a mensagem fora do ciclo do request para evitar timeouts/499."""
-    # SERIALIZA por usuário para evitar corridas de duplicatas
     async with _get_user_lock(phone):
         try:
             async with SessionLocal() as session:
                 res = await session.execute(select(User).where(User.phone == phone))
                 user = res.scalar_one_or_none()
                 if not user:
-                    # tenta aproveitar pushName SOB VALIDAÇÃO
                     pn = _pushname_candidate(push_name)
                     user = User(phone=phone, name=pn or None)
                     session.add(user)
                     await session.commit()
                     await session.refresh(user)
                 else:
-                    # atualiza com pushName válido se ainda não houver nome ou se nome atual for ruim
                     if not (user.name or "").strip() or _is_bad_name(user.name):
                         pn = _pushname_candidate(push_name)
                         if pn:
@@ -865,27 +828,40 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                             await session.commit()
 
                 menu_recent          = await _has_recent_menu(session, user.id, minutes=30)
+                menu_ack_recent      = await _has_recent_menu_ack(session, user.id, minutes=30)
                 video_recent         = await _has_recent_video(session, user.id, minutes=30)
                 handoff_recent       = await _has_recent_handoff(session, user.id, minutes=30)
                 handoff_offer_recent = await _has_recent_handoff_offer(session, user.id, minutes=30)
-                name_request_recent  = await _has_recent_name_request(session, user.id, minutes=30)
+                name_request_recent  = await _has_recent_generic(session, user.id, "name_request", minutes=30)
 
                 # 0) Se houve caixinha recente, trate SIM/NÃO localmente (sem IA).
                 if msg_type == "text" and text and menu_recent:
-                    # NEGATIVO: encerra na hora
-                    if _is_negative_reply(text):
+                    # Se já houve ACK de caixinha e isto parece apenas payload do clique, ignorar.
+                    if menu_ack_recent and _is_menu_click_payload(text):
+                        print("[menu] clique duplicado suprimido (menu_ack recente).")
+                        return
+
+                    # NEGATIVO: encerra na hora — só se ainda não enviamos vídeo (evita vídeo + encerramento)
+                    if _is_negative_reply(text) and not video_recent:
                         end_text = LUNA_END_TEXT or "Tudo bem! Se precisar depois, estou por aqui. 🌟"
                         try:
                             await send_whatsapp_message(phone=phone, content=end_text, type_="text")
                         except Exception as e:
                             print(f"[uazapi] send end_text failed (bg): {e!r}")
                         session.add(Message(user_id=user.id, sender="assistant", content=end_text, media_type="text"))
+                        # grava ACK da caixinha (no)
+                        session.add(Message(user_id=user.id, sender="assistant", content="menu:no", media_type="menu_ack"))
                         await session.commit()
                         return
-                    # POSITIVO: apenas se ainda não enviamos vídeo recentemente
+
+                    # POSITIVO: envia vídeo apenas se ainda não houve envio
                     if _is_positive_reply(text) and not video_recent:
                         await _enviar_video(session, phone, user)
+                        # grava ACK da caixinha (yes)
+                        session.add(Message(user_id=user.id, sender="assistant", content="menu:yes", media_type="menu_ack"))
+                        await session.commit()
                         return
+                    # Se não ficou claro, segue fluxo normal (IA).
 
                 # 0.1) Estado aguardando NOME
                 if msg_type == "text" and text and name_request_recent and not handoff_recent:
@@ -922,7 +898,6 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                 # 0.3) Respostas à OFERTA de handoff (consentimento)
                 if msg_type == "text" and text and handoff_offer_recent and not handoff_recent:
                     if _wants_now(text):
-                        # Se não temos nome, pedir antes de notificar
                         if not (user.name or "").strip():
                             try:
                                 await send_whatsapp_message(phone=phone, content=ASK_NAME_TEMPLATE, type_="text")
@@ -931,7 +906,6 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                             session.add(Message(user_id=user.id, sender="assistant", content=ASK_NAME_TEMPLATE, media_type="name_request"))
                             await session.commit()
                             return
-                        # Já temos nome → confirma e notifica
                         try:
                             ack = HANDOFF_CONFIRM_TEMPLATE.format(consultor=HANDOFF_CONSULTOR_NAME)
                         except Exception:
@@ -953,7 +927,6 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         session.add(Message(user_id=user.id, sender="assistant", content=msg, media_type="text"))
                         await session.commit()
                         return
-                    # Se não ficou claro → segue para IA.
 
                 # 1) Texto -> consulta IA (com CONTEXTO do estado + PHONE)
                 if msg_type == "text" and text:
@@ -962,7 +935,6 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                     digits_phone = _only_digits(phone or "")
                     meta_phone = f"(meta: phone_do_lead:+{digits_phone}. Ao chamar tools use este valor no parâmetro 'phone'.) "
 
-                    # NLU leve: detectar formato informado pelo usuário para dirigir o próximo passo
                     user_formato = _extract_formato(text or "")
 
                     prefix = ""
@@ -982,49 +954,41 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
 
                     ai_input = (meta_phone + prefix + (text or "")).strip()
 
-                    # Sugestão para IA: se já temos formato, não perguntar de novo
                     if user_formato:
                         ai_input += f" [contexto_formato: o lead já indicou o formato '{user_formato}'. Não repita a pergunta de formato; confirme e avance.]"
 
                     reply_text = await ask_assistant(thread_id, ai_input) or ""
                     raw_reply_for_tools = reply_text
 
-                    # Se a IA insistir em perguntar formato mas nós já temos, substitui por confirmação
                     if user_formato and _looks_like_format_question(reply_text):
                         reply_text = f"Perfeito, anotei: **{user_formato}**. Vamos avançar para os próximos passos?"
 
                     wants_menu, wants_video, wants_handoff = _parse_tool_hints(raw_reply_for_tools)
 
-                    # 1.a) Se a IA pediu caixinha/convite
                     if (wants_menu or _looks_like_invite(raw_reply_for_tools)) and not menu_recent:
                         await _enviar_menu(session, phone, user)
                         return
                     if (wants_menu or _looks_like_invite(raw_reply_for_tools)) and menu_recent:
                         print("[guard] IA/convite pediu caixinha, mas já existe recente; ignorando convite.")
 
-                    # 1.b) Se a IA pediu VÍDEO
                     if wants_video and not video_recent:
                         await _enviar_video(session, phone, user)
                         return
                     if wants_video and video_recent:
                         print("[guard] IA pediu vídeo, mas já enviamos recentemente; ignorando.")
 
-                    # 1.c) Handoff por CONSENTIMENTO:
                     if (wants_handoff or user_formato) and not (handoff_recent or handoff_offer_recent):
                         await _send_handoff_offer(session, phone=phone, user=user, formato=user_formato)
                         return
 
-                    # 1.d) Fallback opcional — vídeo após SIM na caixinha (se IA não mandou)
                     if not LUNA_STRICT_ASSISTANT and _is_positive_reply(text) and menu_recent and not video_recent:
                         await _enviar_video(session, phone, user)
                         return
 
-                    # 1.e) Anti-eco (convite) após caixinha
                     if menu_recent and _looks_like_invite(raw_reply_for_tools):
                         print("[guard] menu enviado há pouco; suprimindo texto convite duplicado.")
                         return
 
-                    # 1.f) Texto normal para o lead (SEM as tags #tools(...))
                     clean_text = _strip_tool_tags(reply_text) or "Certo!"
                     try:
                         await send_whatsapp_message(phone=phone, content=clean_text, type_="text")
