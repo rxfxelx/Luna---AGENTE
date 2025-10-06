@@ -1,12 +1,14 @@
-# Webhook e endpoints para WhatsApp (Uazapi).
-#
-# Fluxo resumido:
-# - Encaminha texto do lead para a IA (Assistant) COM contexto de estado (caixinha/vídeo) + phone do lead.
-# - Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints por texto ou por tag #tools()).
-# - Atalho local: após a caixinha, interpreta SIM/NÃO sem chamar a IA (responde na hora).
-# - Fallback opcional: vídeo após SIM na caixinha (configurável).
-# - Handoff: agora é por CONSENTIMENTO — só notifica consultores após o lead aceitar.
-# - Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações + lock por usuário.
+"""
+Webhook e endpoints para WhatsApp (Uazapi).
+
+Fluxo resumido:
+- Encaminha texto do lead para a IA (Assistant) COM contexto de estado (caixinha/vídeo) + phone do lead.
+- Envia CAIXINHA/VÍDEO quando a IA solicitar (tool-hints por texto ou por tag #tools()).
+- Atalho local: após a caixinha, interpreta SIM/NÃO sem chamar a IA (responde na hora).
+- Fallback opcional: vídeo após SIM na caixinha (configurável).
+- Handoff: agora é por CONSENTIMENTO — só notifica consultores após o lead aceitar.
+- Deduplicação do inbound (mesmo conteúdo ≤ 5s) e anti-duplicação de ações + lock por usuário.
+"""
 
 from __future__ import annotations
 
@@ -132,7 +134,7 @@ def _ensure_authorised(request: Request, header_token: Optional[str]) -> None:
 
 _phone_regex = re.compile(r"(?:^|\D)(\+?\d{10,15})(?:\D|$)")
 
-# ADIÇÃO: prioriza selectedDisplayText dos botões antes dos IDs
+# PRIORIDADE: textos normais -> displayText de botões -> ids de botões/listas
 TEXT_KEYS_PRIORITY = (
     # Baileys-like / variados
     "data.data.messages.0.message.conversation",
@@ -140,16 +142,19 @@ TEXT_KEYS_PRIORITY = (
     "messages.0.message.conversation",
     "messages.0.message.extendedTextMessage.text",
 
-    # Respostas de botões (display text primeiro)
+    # Respostas de botões / listas (display text primeiro)
     "messages.0.message.buttonsResponseMessage.selectedDisplayText",
     "data.data.messages.0.message.buttonsResponseMessage.selectedDisplayText",
     "messages.0.message.templateButtonReplyMessage.selectedDisplayText",
     "data.data.messages.0.message.templateButtonReplyMessage.selectedDisplayText",
+    "messages.0.message.listResponseMessage.title",
+    "data.data.messages.0.message.listResponseMessage.title",
 
-    # IDs de botões/listas
+    # IDs (fallbacks)
     "messages.0.message.buttonsResponseMessage.selectedButtonId",
     "data.data.messages.0.message.buttonsResponseMessage.selectedButtonId",
-    "messages.0.message.listResponseMessage.title",
+    "messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
+    "data.data.messages.0.message.listResponseMessage.singleSelectReply.selectedRowId",
 
     # Uazapi simples
     "messages.0.text",
@@ -258,7 +263,7 @@ def _extract_text_generic(event: Dict[str, Any]) -> Optional[str]:
     walk(event)
     return found
 
-def _is_from_me(event: Dict[str, Any]) -> bool:
+def _is_from_me_raw(event: Dict[str, Any]) -> bool:
     for path in (
         "data.data.messages.0.key.fromMe",
         "messages.0.key.fromMe",
@@ -268,6 +273,30 @@ def _is_from_me(event: Dict[str, Any]) -> bool:
     ):
         v = _deep_get(event, path)
         if isinstance(v, bool) and v:
+            return True
+    return False
+
+def _has_interactive_reply(event: Dict[str, Any]) -> bool:
+    """True se o payload tem resposta de botão/lista (mesmo que fromMe venha True)."""
+    for p in (
+        "data.data.messages.0.message.buttonsResponseMessage",
+        "messages.0.message.buttonsResponseMessage",
+        "data.data.messages.0.message.templateButtonReplyMessage",
+        "messages.0.message.templateButtonReplyMessage",
+        "data.data.messages.0.message.listResponseMessage",
+        "messages.0.message.listResponseMessage",
+    ):
+        if _deep_get(event, p) is not None:
+            return True
+    # também considera quando já temos o texto extraído via campos de resposta
+    for p in (
+        "data.data.messages.0.message.buttonsResponseMessage.selectedDisplayText",
+        "messages.0.message.buttonsResponseMessage.selectedDisplayText",
+        "data.data.messages.0.message.buttonsResponseMessage.selectedButtonId",
+        "messages.0.message.buttonsResponseMessage.selectedButtonId",
+    ):
+        v = _deep_get(event, p)
+        if isinstance(v, str) and v.strip():
             return True
     return False
 
@@ -342,12 +371,23 @@ def _extract_sender_and_type(event: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
 # --------------------------- Fluxo helpers ---------------------------
 
+_POSITIVE_WORDS = {
+    "sim", "ok", "okay", "claro", "perfeito", "pode", "pode sim", "pode continuar",
+    "vamos", "bora", "manda", "mande", "envia", "enviar", "segue", "segue sim",
+    "quero", "tenho interesse", "interessa", "top", "show", "positivo", "agora",
+    "mais tarde", "sim pode", "pode mandar", "pode enviar", "pode mostrar",
+}
+_NEGATIVE_WORDS = {"nao", "não", "nao obrigado", "não obrigado", "pode encerrar", "parar", "cancelar", "encerre"}
 _POSITIVE_EMOJIS = {"👍", "👌", "✅", "✔️", "✌️", "🤝"}
 
 # tokens canônicos usados pelo matcher de SIM/NÃO
-_YES_TOKENS = {"sim", "ok", "okay", "claro", "perfeito", "pode", "agora", "continuar", "prosseguir",
-               "segue", "manda", "enviar", "mostrar", "yes", "y", "s"}
-_NO_TOKENS  = {"nao", "não", "no", "n", "parar", "cancelar", "encerrar", "encerrarcontato", "recusar"}
+_YES_TOKENS = {
+    "sim", "ok", "okay", "claro", "perfeito", "pode", "agora", "continuar", "prosseguir",
+    "segue", "manda", "enviar", "mostrar", "yes", "y", "s"
+}
+_NO_TOKENS = {
+    "nao", "não", "no", "n", "parar", "cancelar", "encerrar", "encerrarcontato", "recusar"
+}
 
 async def _has_recent_generic(session: AsyncSession, user_id: int, media_type: str, minutes: int) -> bool:
     try:
@@ -373,9 +413,6 @@ async def _has_recent_generic(session: AsyncSession, user_id: int, media_type: s
 async def _has_recent_menu(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "menu", minutes)
 
-async def _has_recent_menu_ack(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
-    return await _has_recent_generic(session, user_id, "menu_ack", minutes)
-
 async def _has_recent_video(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "video", minutes)
 
@@ -385,20 +422,9 @@ async def _has_recent_handoff(session: AsyncSession, user_id: int, minutes: int 
 async def _has_recent_handoff_offer(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
     return await _has_recent_generic(session, user_id, "handoff_offer", minutes)
 
-def _is_menu_click_payload(text: Optional[str]) -> bool:
-    """Retorna True se 'text' parece ser apenas o payload de um clique (0/1/labels do ENV)."""
-    if not text:
-        return False
-    t = _normalize_soft(text)
-    if t in {"0", "1"}:
-        return True
-    ly = _normalize_soft(LUNA_MENU_YES)
-    ln = _normalize_soft(LUNA_MENU_NO)
-    if ly and (t == ly or ly in t):
-        return True
-    if ln and (t == ln or ln in t):
-        return True
-    return False
+# estado "name_request" (quando pedimos o nome)
+async def _has_recent_name_request(session: AsyncSession, user_id: int, minutes: int = 30) -> bool:
+    return await _has_recent_generic(session, user_id, "name_request", minutes)
 
 def _is_positive_reply(text: Optional[str]) -> bool:
     if not text:
@@ -440,6 +466,33 @@ def _is_negative_reply(text: Optional[str]) -> bool:
     if toks & _NO_TOKENS:
         return True
     return False
+
+# Handoff: distinção entre "agora" e "mais tarde"
+def _wants_now(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    t = _normalize_soft(text)
+    return ("agora" in t) or (t in {"sim", "ok", "okay", "claro", "perfeito", "pode", "podesim"})
+
+def _wants_later(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    t = _normalize_soft(text)
+    return any(p in t for p in ("maistarde", "depois", "amanha", "amanhã"))
+
+_INVITE_PATTERNS = (
+    "quer ver em 30", "quer ver em 30s", "quer ver em 30 s",
+    "30 seg", "30seg", "30 segundos", "trinta segundos",
+    "posso te mostrar", "posso apresentar um case", "exemplo objetivo",
+    "te mostro em 30", "posso enviar um exemplo", "quer ver um exemplo",
+    "apresentar um case curto"
+)
+
+def _looks_like_invite(reply_text: str) -> bool:
+    if not reply_text:
+        return False
+    t = _normalize(reply_text)
+    return any(p in t for p in _INVITE_PATTERNS)
 
 # --------- NLU leve: formato (evitar pergunta duplicada) ---------
 
@@ -672,6 +725,7 @@ def _is_bad_name(name: Optional[str]) -> bool:
     return False
 
 def _pushname_candidate(push_name: Optional[str]) -> Optional[str]:
+    """Valida pushName do WhatsApp para evitar salvar 'Oi Blz', 'Atendimento', etc."""
     name = _sanitize_name(push_name or "")
     if not name or _is_bad_name(name):
         return None
@@ -681,6 +735,7 @@ def _pushname_candidate(push_name: Optional[str]) -> Optional[str]:
     return name
 
 def _extract_name_from_text(text: Optional[str], *, in_request: bool = False) -> Optional[str]:
+    """Aceita padrão explícito; se 'in_request'=True, aceita resposta curta (ex.: 'Matheus')."""
     if not text:
         return None
     m = _NAME_EXPLICIT_RE.search(text)
@@ -690,6 +745,7 @@ def _extract_name_from_text(text: Optional[str], *, in_request: bool = False) ->
         return _sanitize_name(text)
     return None
 
+# Detecta se a assistente perguntou o nome recentemente
 _NAME_ASK_PATTERNS = (
     "com quem estou falando",
     "posso saber com quem estou falando",
@@ -828,40 +884,25 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                             await session.commit()
 
                 menu_recent          = await _has_recent_menu(session, user.id, minutes=30)
-                menu_ack_recent      = await _has_recent_menu_ack(session, user.id, minutes=30)
                 video_recent         = await _has_recent_video(session, user.id, minutes=30)
                 handoff_recent       = await _has_recent_handoff(session, user.id, minutes=30)
                 handoff_offer_recent = await _has_recent_handoff_offer(session, user.id, minutes=30)
-                name_request_recent  = await _has_recent_generic(session, user.id, "name_request", minutes=30)
+                name_request_recent  = await _has_recent_name_request(session, user.id, minutes=30)
 
                 # 0) Se houve caixinha recente, trate SIM/NÃO localmente (sem IA).
                 if msg_type == "text" and text and menu_recent:
-                    # Se já houve ACK de caixinha e isto parece apenas payload do clique, ignorar.
-                    if menu_ack_recent and _is_menu_click_payload(text):
-                        print("[menu] clique duplicado suprimido (menu_ack recente).")
-                        return
-
-                    # NEGATIVO: encerra na hora — só se ainda não enviamos vídeo (evita vídeo + encerramento)
-                    if _is_negative_reply(text) and not video_recent:
+                    if _is_negative_reply(text):
                         end_text = LUNA_END_TEXT or "Tudo bem! Se precisar depois, estou por aqui. 🌟"
                         try:
                             await send_whatsapp_message(phone=phone, content=end_text, type_="text")
                         except Exception as e:
                             print(f"[uazapi] send end_text failed (bg): {e!r}")
                         session.add(Message(user_id=user.id, sender="assistant", content=end_text, media_type="text"))
-                        # grava ACK da caixinha (no)
-                        session.add(Message(user_id=user.id, sender="assistant", content="menu:no", media_type="menu_ack"))
                         await session.commit()
                         return
-
-                    # POSITIVO: envia vídeo apenas se ainda não houve envio
                     if _is_positive_reply(text) and not video_recent:
                         await _enviar_video(session, phone, user)
-                        # grava ACK da caixinha (yes)
-                        session.add(Message(user_id=user.id, sender="assistant", content="menu:yes", media_type="menu_ack"))
-                        await session.commit()
                         return
-                    # Se não ficou claro, segue fluxo normal (IA).
 
                 # 0.1) Estado aguardando NOME
                 if msg_type == "text" and text and name_request_recent and not handoff_recent:
@@ -927,6 +968,7 @@ async def _process_message_async(phone: str, msg_type: str, text: Optional[str],
                         session.add(Message(user_id=user.id, sender="assistant", content=msg, media_type="text"))
                         await session.commit()
                         return
+                    # Se não ficou claro → segue para IA.
 
                 # 1) Texto -> consulta IA (com CONTEXTO do estado + PHONE)
                 if msg_type == "text" and text:
@@ -1021,12 +1063,14 @@ async def webhook_post(
 ) -> Response:
     _ensure_authorised(request, x_webhook_token)
 
+    # >>> NÃO descartar interativos marcados como fromMe pela Uazapi
     try:
         payload = await request.json()
     except Exception:
         return JSONResponse({"received": False, "reason": "invalid JSON"}, status_code=200)
 
-    if _is_from_me(payload):
+    # Se NÃO é resposta interativa e vier de mim, descarta
+    if _is_from_me_raw(payload) and not _has_interactive_reply(payload):
         return JSONResponse({"received": True, "note": "from_me"}, status_code=200)
 
     info = _extract_sender_and_type(payload)
@@ -1034,7 +1078,7 @@ async def webhook_post(
     msg_type = info.get("msg_type") or "unknown"
     text = info.get("text")
 
-    print(f"[webhook] extracted phone={phone} type={msg_type} text_len={(len(text) if text else 0)}")
+    print(f"[webhook] extracted phone={phone} type={msg_type} text_len={(len(text) if text else 0)} inter={_has_interactive_reply(payload)}")
 
     if not phone:
         print(f"[webhook] no phone extracted; sample={str(payload)[:400]}")
