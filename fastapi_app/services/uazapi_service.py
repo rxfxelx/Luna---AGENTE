@@ -22,33 +22,50 @@ from typing import Any, Dict, Iterable, Optional, List, Tuple
 import httpx
 
 
-# -------------------- Config UAZAPI --------------------
+# =====================================================================
+#                          CONFIGURAÇÃO UAZAPI
+# =====================================================================
+
 UAZAPI_BASE_URL = os.getenv("UAZAPI_BASE_URL", "").rstrip("/")
 UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN", "")
 
 # Nome do header de auth na sua instância (ex.: "token", "apikey", "authorization", "authorization_bearer")
 UAZAPI_AUTH_HEADER_NAME = os.getenv("UAZAPI_AUTH_HEADER_NAME", "token").lower()
 
-# Timeout configurável (segundos) sem alterar o padrão anterior
+# Timeout (s)
 UAZAPI_TIMEOUT = float(os.getenv("UAZAPI_TIMEOUT", "60"))
 
-# Rotas (permite override por ENV); inclui fallbacks para variações de instância
+# Debug verboso no console
+UAZAPI_DEBUG = os.getenv("UAZAPI_DEBUG", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# Rotas (permite override por ENV) + fallbacks comuns em distribuições
 UAZAPI_SEND_TEXT_PATH = os.getenv("UAZAPI_SEND_TEXT_PATH", "/send/text")
 UAZAPI_SEND_MEDIA_PATH = os.getenv("UAZAPI_SEND_MEDIA_PATH", "/send/media")
 UAZAPI_SEND_MENU_PATH = os.getenv("UAZAPI_SEND_MENU_PATH", "/send/menu")
 
 _TEXT_FALLBACKS = ["/sendMessage", "/api/sendText", "/api/sendMessage", "/api/send/message", "/send-message"]
 _MEDIA_FALLBACKS = ["/send/file", "/api/sendFile", "/api/sendMedia", "/file/send"]
-# menus: acrescentados fallbacks mais comuns em distros (buttons)
 _MENU_FALLBACKS = [
     "/send/menu", "/sendMenu", "/api/sendMenu", "/menus/send",
     "/send/buttons", "/sendButtons", "/api/sendButtons", "/buttons/send"
 ]
 
 
-# -------------------- Config BASEROW --------------------
+# =====================================================================
+#                          CONFIGURAÇÃO BASEROW
+# =====================================================================
+
 BASEROW_BASE_URL = os.getenv("BASEROW_BASE_URL", "").rstrip("/")
 BASEROW_API_TOKEN = os.getenv("BASEROW_API_TOKEN", "")
+
+
+# =====================================================================
+#                                 UTILS
+# =====================================================================
+
+def _dbg(msg: str) -> None:
+    if UAZAPI_DEBUG:
+        print(msg)
 
 
 def _headers() -> Dict[str, str]:
@@ -174,7 +191,18 @@ async def _download_bytes(url: str) -> Tuple[Optional[bytes], Optional[str]]:
         return None, None
 
 
-# -------------------- Envio WhatsApp --------------------
+def _only_digits(s: str) -> str:
+    return "".join(ch for ch in str(s) if ch.isdigit())
+
+
+def _chatid_variants(digits: str) -> List[str]:
+    return [f"{digits}@c.us", f"{digits}@s.whatsapp.net"]
+
+
+# =====================================================================
+#                          ENVIO – WHATSAPP
+# =====================================================================
+
 async def send_whatsapp_message(
     phone: str,
     content: str,
@@ -186,7 +214,7 @@ async def send_whatsapp_message(
 ) -> Dict[str, Any]:
     """
     Envia mensagem via UAZAPI (texto, mídia, menu).
-    - Para vídeo: usar type_="video" ou fornecer media_url terminando em .mp4 (MIME de vídeo).
+    - Para vídeo: usar type_="video" OU fornecer media_url terminando em .mp4 (MIME de vídeo).
     Retorna dict (JSON) em sucesso; levanta RuntimeError em falha.
     """
     if not UAZAPI_BASE_URL:
@@ -197,7 +225,7 @@ async def send_whatsapp_message(
     plus_digits = digits if str(digits).startswith("+") else f"+{digits}"
 
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=UAZAPI_TIMEOUT) as client:
-        # ============ TEXTO ============
+        # ======================= TEXTO =======================
         if type_ == "text" or not media_url:
             for endpoint in _text_endpoints():
                 endpoint = _ensure_leading_slash(endpoint)
@@ -221,14 +249,14 @@ async def send_whatsapp_message(
                     for t in text_variants:
                         payload = {**d, **t}
                         try:
+                            _dbg(f"[uazapi→] POST {endpoint} JSON keys={list(payload.keys())}")
                             resp = await client.post(endpoint, json=payload, headers=headers)
+                            _dbg(f"[uazapi←] {resp.status_code} body={resp.text[:300].replace(chr(10),' ')}")
                             if resp.status_code < 400:
                                 try:
                                     return resp.json()
                                 except Exception:
                                     return {"status": "ok", "http_status": resp.status_code}
-                            else:
-                                print(f"[uazapi] {endpoint} JSON{list(payload.keys())} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
                         except Exception as exc:
                             print(f"[uazapi] exception on {endpoint} JSON{list(payload.keys())}: {exc}")
 
@@ -237,74 +265,80 @@ async def send_whatsapp_message(
                     for t in text_variants:
                         form = {**d, **t}
                         try:
+                            _dbg(f"[uazapi→] POST {endpoint} FORM keys={list(form.keys())}")
                             resp = await client.post(endpoint, data=form, headers=headers)
+                            _dbg(f"[uazapi←] {resp.status_code} body={resp.text[:300].replace(chr(10),' ')}")
                             if resp.status_code < 400:
                                 try:
                                     return resp.json()
                                 except Exception:
                                     return {"status": "ok", "http_status": resp.status_code}
-                            else:
-                                print(f"[uazapi] {endpoint} FORM{list(form.keys())} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
                         except Exception as exc:
                             print(f"[uazapi] exception on {endpoint} FORM{list(form.keys())}: {exc}")
 
                 # (3) params + body attempts (alguns endpoints esperam number na query)
                 for d in dest_variants:
                     try:
+                        _dbg(f"[uazapi→] POST {endpoint} PARAMS={list(d.keys())} + FORM[text]")
                         resp = await client.post(endpoint, params=d, data={"text": content}, headers=headers)
+                        _dbg(f"[uazapi←] {resp.status_code} body={resp.text[:300].replace(chr(10),' ')}")
                         if resp.status_code < 400:
                             try:
                                 return resp.json()
                             except Exception:
                                 return {"status": "ok", "http_status": resp.status_code}
-                        else:
-                            print(f"[uazapi] {endpoint} PARAMS{list(d.keys())}+FORM[text] {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
+
+                        _dbg(f"[uazapi→] POST {endpoint} PARAMS={list(d.keys())} + FORM[message]")
                         resp = await client.post(endpoint, params=d, data={"message": content}, headers=headers)
+                        _dbg(f"[uazapi←] {resp.status_code} body={resp.text[:300].replace(chr(10),' ')}")
                         if resp.status_code < 400:
                             try:
                                 return resp.json()
                             except Exception:
                                 return {"status": "ok", "http_status": resp.status_code}
-                        else:
-                            print(f"[uazapi] {endpoint} PARAMS{list(d.keys())}+FORM[message] {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
                     except Exception as exc:
                         print(f"[uazapi] exception on {endpoint} PARAMS{list(d.keys())}: {exc}")
 
             raise RuntimeError(f"UAZAPI text send failed for phone={phone}")
 
-        # ============ MÍDIA (inclui VÍDEO) ============
+        # ======================= MÍDIA (incl. VÍDEO) =======================
         mime = (mime_type or _infer_mime_from_url(media_url or "")) if media_url else (mime_type or "")
         base_caption = (caption or content or "").strip()
 
         # 1) Tenta JSON via /send/media para VÍDEO com media_url público (recomendado)
         if type_ == "video" or (mime and mime.startswith("video/")):
-            # >>>>>>> CORREÇÃO AQUI: usar chaves 'type' e 'file' conforme UAZAPI <<<<<<<
-            base_payload = {"type": "video", "file": media_url, "caption": base_caption}
-            candidate_payloads: List[Dict[str, Any]] = [
-                {**base_payload, "number": digits},
-                {**base_payload, "number": plus_digits},
-                {**base_payload, "phone": digits},
-                {**base_payload, "phone": plus_digits},
-                {**base_payload, "jid": f"{digits}@s.whatsapp.net"},
-                {**base_payload, "chatId": f"{digits}@c.us"},
+            # Variações de payload que já vi em distros diferentes:
+            base_payloads: List[Dict[str, Any]] = [
+                {"type": "video", "file": media_url, "caption": base_caption},
+                {"type": "video", "url": media_url,  "caption": base_caption},
+                {"type": "video", "file": media_url, "text": base_caption},
+                {"type": "video", "url": media_url,  "text": base_caption},
+            ]
+            dests = [
+                {"number": digits}, {"number": plus_digits},
+                {"phone": digits},  {"phone": plus_digits},
+                {"jid": f"{digits}@s.whatsapp.net"},
+                {"chatId": f"{digits}@c.us"},
             ]
             for endpoint in _media_endpoints():
                 endpoint = _ensure_leading_slash(endpoint)
                 # pula variantes estritamente de upload de arquivo
                 if "sendFile" in endpoint or "/send/file" in endpoint or "/file/send" in endpoint:
                     continue
-                for payload in candidate_payloads:
-                    try:
-                        resp = await client.post(endpoint, json=payload, headers=headers)
-                        if resp.status_code < 400:
-                            try:
-                                return resp.json()
-                            except Exception:
-                                return {"status": "ok", "http_status": resp.status_code}
-                        else:
-                            print(f"[uazapi] {endpoint} JSON{list(payload.keys())} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
-                    except Exception as exc:
-                        print(f"[uazapi] exception on {endpoint} JSON{list(payload.keys())}: {exc}")
+                for bp in base_payloads:
+                    for d in dests:
+                        payload = {**bp, **d}
+                        try:
+                            _dbg(f"[uazapi→] POST {endpoint} JSON keys={list(payload.keys())}")
+                            resp = await client.post(endpoint, json=payload, headers=headers)
+                            _dbg(f"[uazapi←] {resp.status_code} body={resp.text[:300].replace(chr(10),' ')}")
+                            if resp.status_code < 400:
+                                try:
+                                    return resp.json()
+                                except Exception:
+                                    return {"status": "ok", "http_status": resp.status_code}
+                        except Exception as exc:
+                            print(f"[uazapi] exception on {endpoint} JSON{list(payload.keys())}: {exc}")
 
         # 2) Fallback: baixa arquivo e envia multipart (cobre imagem, doc, e vídeo se necessário)
         file_bytes, filename = await _download_bytes(media_url or "")
@@ -326,14 +360,14 @@ async def send_whatsapp_message(
                 ]
                 for q in query_variants:
                     try:
+                        _dbg(f"[uazapi→] POST {endpoint} QUERY={list(q.keys())} multipart")
                         resp = await client2.post(endpoint, params=q, data={"caption": base_caption}, files=files, headers=headers)
+                        _dbg(f"[uazapi←] {resp.status_code} body={resp.text[:300].replace(chr(10),' ')}")
                         if resp.status_code < 400:
                             try:
                                 return resp.json()
                             except Exception:
                                 return {"status": "ok", "http_status": resp.status_code}
-                        else:
-                            print(f"[uazapi] {endpoint} QUERY{list(q.keys())} FORM {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
                     except Exception as exc:
                         print(f"[uazapi] exception on {endpoint} QUERY{list(q.keys())} multipart: {exc}")
 
@@ -348,25 +382,24 @@ async def send_whatsapp_message(
                 ]
                 for form in form_variants:
                     try:
+                        _dbg(f"[uazapi→] POST {endpoint} FORM keys={list(form.keys())} multipart")
                         resp = await client2.post(endpoint, data=form, files=files, headers=headers)
+                        _dbg(f"[uazapi←] {resp.status_code} body={resp.text[:300].replace(chr(10),' ')}")
                         if resp.status_code < 400:
                             try:
                                 return resp.json()
                             except Exception:
                                 return {"status": "ok", "http_status": resp.status_code}
-                        else:
-                            print(f"[uazapi] {endpoint} FORM{list(form.keys())} {resp.status_code} body={resp.text[:200].replace(chr(10),' ')}")
                     except Exception as exc:
                         print(f"[uazapi] exception on {endpoint} FORM{list(form.keys())}: {exc}")
 
         raise RuntimeError(f"UAZAPI media send failed for phone={phone}")
 
 
-def _chatid_variants(digits: str) -> List[str]:
-    return [f"{digits}@c.us", f"{digits}@s.whatsapp.net"]
+# =====================================================================
+#                          MENU INTERATIVO
+# =====================================================================
 
-
-# -------------------- Menu Interativo --------------------
 def _flatten_for_form(d: Dict[str, Any]) -> Dict[str, Any]:
     """Converte valores dict/list em JSON string para envio form-urlencoded."""
     out: Dict[str, Any] = {}
@@ -386,20 +419,27 @@ async def send_menu_interesse(
     footer_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Envia um menu interativo de botões (Sim/Não) de acordo com o contrato oficial do
-    endpoint `/send/menu da UAZAPI. Conforme documentado, um payload válido para
-    botões deve conter apenas os campos `number, type, text, choices e
-    opcionalmente `footerText`. O número deve estar no formato
-    E.164 sem o sinal de `+ e cada opção em choices é uma string no formato
-    `"Título|ID"`.
+    Envia um menu interativo de botões (Sim/Não).
+
+    Contrato preferencial (UAZAPI GO / /send/menu):
+      {
+        "number": "55319...9",
+        "type": "button",
+        "text": "<texto>",
+        "choices": ["Sim, pode continuar|YES", "Não, encerrar contato|NO"],
+        "footerText": "opcional"
+      }
+
+    Implementa fallbacks automáticos para variações (“buttons”, “options”, etc.).
     """
     if not UAZAPI_BASE_URL:
         raise RuntimeError("UAZAPI_BASE_URL não configurada.")
     digits = _only_digits(phone)
     if not digits:
         raise ValueError("Número de telefone inválido ou vazio.")
-    # Constrói o payload conforme a documentação oficial da UAZAPI para mensagens interativas
-    payload: Dict[str, Any] = {
+
+    # 0) Canonical payload (documentado)
+    canonical_payload: Dict[str, Any] = {
         "number": digits,
         "type": "button",
         "text": text,
@@ -409,25 +449,113 @@ async def send_menu_interesse(
         ],
     }
     if footer_text:
-        payload["footerText"] = footer_text
-    endpoint = _ensure_leading_slash(UAZAPI_SEND_MENU_PATH or "/send/menu")
+        canonical_payload["footerText"] = footer_text
+
     async with httpx.AsyncClient(base_url=UAZAPI_BASE_URL, timeout=UAZAPI_TIMEOUT) as client:
-        resp = await client.post(endpoint, json=payload, headers=_headers())
-        body = resp.text
-        if resp.status_code >= 400:
-            # Log do erro para depuração; inclui parte do corpo retornado
-            print(f"[uazapi] MENU {endpoint} status={resp.status_code} body={body[:300]}")
-            raise RuntimeError(
-                f"UAZAPI menu send failed for phone={phone} status={resp.status_code}"
-            )
-        # Retorna o JSON decodificado se possível, ou um dict genérico caso contrário
-        try:
-            return resp.json()
-        except Exception:
-            return {"status": "ok", "http_status": resp.status_code, "raw": body}
+        # 1) Tenta canonical
+        for endpoint in _menu_endpoints():
+            ep = _ensure_leading_slash(endpoint)
+            try:
+                _dbg(f"[uazapi→] POST {ep} JSON keys={list(canonical_payload.keys())}")
+                resp = await client.post(ep, json=canonical_payload, headers=_headers())
+                _dbg(f"[uazapi←] {resp.status_code} body={resp.text[:400].replace(chr(10),' ')}")
+                if resp.status_code < 400:
+                    try:
+                        return resp.json()
+                    except Exception:
+                        return {"status": "ok", "http_status": resp.status_code, "raw": resp.text}
+            except Exception as exc:
+                print(f"[uazapi] exception MENU {ep} JSON: {exc}")
+
+        # 2) Fallbacks (estruturas alternativas encontradas em outras distros)
+        alt_payloads: List[Dict[str, Any]] = []
+
+        # (A) type 'buttons' + array de objetos
+        alt_payloads.append({
+            "number": digits,
+            "type": "buttons",
+            "text": text,
+            "buttons": [
+                {"id": "YES", "text": yes_label},
+                {"id": "NO",  "text": no_label},
+            ],
+            **({"footerText": footer_text} if footer_text else {}),
+        })
+
+        # (B) type 'button' + 'options' (strings simples, alguns servers ignoram IDs)
+        alt_payloads.append({
+            "number": digits,
+            "type": "button",
+            "text": text,
+            "options": [yes_label, no_label],
+            **({"footerText": footer_text} if footer_text else {}),
+        })
+
+        # (C) 'choices' como lista de dicts
+        alt_payloads.append({
+            "number": digits,
+            "type": "button",
+            "text": text,
+            "choices": [
+                {"id": "YES", "title": yes_label},
+                {"id": "NO",  "title": no_label},
+            ],
+            **({"footerText": footer_text} if footer_text else {}),
+        })
+
+        # (D) Variação de destino: phone / to / chatId
+        alt_dest_variants = [
+            {"phone": digits}, {"to": digits},
+            {"chatId": f"{digits}@c.us"}, {"jid": f"{digits}@s.whatsapp.net"}
+        ]
+        alt_base = {
+            "type": "button",
+            "text": text,
+            "choices": [f"{yes_label}|YES", f"{no_label}|NO"],
+            **({"footerText": footer_text} if footer_text else {}),
+        }
+        for d in alt_dest_variants:
+            alt_payloads.append({**alt_base, **d})
+
+        for endpoint in _menu_endpoints():
+            ep = _ensure_leading_slash(endpoint)
+            # JSON
+            for payload in alt_payloads:
+                try:
+                    _dbg(f"[uazapi→] POST {ep} JSON-ALT keys={list(payload.keys())}")
+                    resp = await client.post(ep, json=payload, headers=_headers())
+                    _dbg(f"[uazapi←] {resp.status_code} body={resp.text[:400].replace(chr(10),' ')}")
+                    if resp.status_code < 400:
+                        try:
+                            return resp.json()
+                        except Exception:
+                            return {"status": "ok", "http_status": resp.status_code, "raw": resp.text}
+                except Exception as exc:
+                    print(f"[uazapi] exception MENU {ep} JSON-ALT: {exc}")
+
+            # FORM (algumas distros esperam form-urlencoded)
+            form_payloads = [_flatten_for_form(p) for p in alt_payloads]
+            for form in form_payloads:
+                try:
+                    _dbg(f"[uazapi→] POST {ep} FORM-ALT keys={list(form.keys())}")
+                    resp = await client.post(ep, data=form, headers=_headers())
+                    _dbg(f"[uazapi←] {resp.status_code} body={resp.text[:400].replace(chr(10),' ')}")
+                    if resp.status_code < 400:
+                        try:
+                            return resp.json()
+                        except Exception:
+                            return {"status": "ok", "http_status": resp.status_code, "raw": resp.text}
+                except Exception as exc:
+                    print(f"[uazapi] exception MENU {ep} FORM-ALT: {exc}")
+
+    # Se chegou aqui, falhou
+    raise RuntimeError(f"UAZAPI menu send failed for phone={phone}")
 
 
-# -------------------- Alias retrocompat --------------------
+# =====================================================================
+#                        ALIAS RETROCOMPAT
+# =====================================================================
+
 async def send_message(
     *,
     phone: str,
@@ -455,16 +583,15 @@ async def send_message(
     return await send_whatsapp_message(phone=phone, content=text, type_="text")
 
 
-def _only_digits(s: str) -> str:
-    return "".join(ch for ch in str(s) if ch.isdigit())
-
-
 def normalize_number(s: str) -> str:
-    """Retrocompat."""
+    """Retrocompat: apenas dígitos."""
     return _only_digits(s)
 
 
-# -------------------- Baserow helpers --------------------
+# =====================================================================
+#                        BASEROW – UPLOAD/RESOLVE
+# =====================================================================
+
 async def upload_file_to_baserow(source: str) -> Optional[Dict[str, Any]]:
     """
     Faz upload de um arquivo para o Baserow (quando 'source' é uma URL http/https ou data:),
@@ -493,15 +620,15 @@ async def upload_file_to_baserow(source: str) -> Optional[Dict[str, Any]]:
                 ]
                 for path in candidates:
                     try:
+                        _dbg(f"[baserow→] GET {path}")
                         resp = await client.get(path, headers=headers)
+                        _dbg(f"[baserow←] {resp.status_code} body={resp.text[:300].replace(chr(10),' ')}")
                         if resp.status_code < 400:
                             try:
                                 return resp.json()
                             except Exception:
                                 # pode ser um redirect/arquivo binário; nesse caso, fornece URL direta
                                 return {"url": f"{BASEROW_BASE_URL}{path}"}
-                        else:
-                            print(f"[baserow] GET {path} -> {resp.status_code} {resp.text[:200].replace(chr(10),' ')}")
                     except Exception as exc:
                         print(f"[baserow] exception GET {path}: {exc}")
                 return None
@@ -520,15 +647,15 @@ async def upload_file_to_baserow(source: str) -> Optional[Dict[str, Any]]:
             ]
             for upath in upload_endpoints:
                 try:
+                    _dbg(f"[baserow→] POST {upath} multipart")
                     up = await client.post(upath, files=files, headers=headers)
+                    _dbg(f"[baserow←] {up.status_code} body={up.text[:300].replace(chr(10),' ')}")
                     if up.status_code < 400:
                         try:
                             return up.json()
                         except Exception:
                             # Em cenários raros, retorna vazio com 200
                             return {"status": "ok", "http_status": up.status_code}
-                    else:
-                        print(f"[baserow] POST {upath} -> {up.status_code} {up.text[:240].replace(chr(10),' ')}")
                 except Exception as exc:
                     print(f"[baserow] exception POST {upath}: {exc}")
             return None
